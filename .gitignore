@@ -1,0 +1,18 @@
+bin/
+obj/
+**/bin/
+**/obj/
+__pycache__/
+**/__pycache__/
+.DS_Store
+.idea/
+.fake
+.vs
+*.user
+
+# Local model conversion artifacts.
+models/
+onnx/
+sample_inputs/
+sample_outputs/
+served_runs/

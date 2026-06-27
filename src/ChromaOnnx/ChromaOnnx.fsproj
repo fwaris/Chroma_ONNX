@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="ModelStructure.fs" />
+    <Compile Include="SharedWeights.fs" />
+    <Compile Include="TensorUtils.fs" />
+    <Compile Include="Media.fs" />
+    <Compile Include="ProcessAndMemory.fs" />
+    <Compile Include="ChromaNativeProcessor.fs" />
+    <Compile Include="LegacyOnnxRunners.fs" />
+    <Compile Include="S2sOnnxRunner.fs" />
+    <Compile Include="S2sService.fs" />
+    <Compile Include="OneFrameService.fs" />
+    <Compile Include="Cli.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="libtorch-cpu" Version="2.10.0.0" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.27.0" />
+    <PackageReference Include="Tokenizers.HuggingFace" Version="2.21.4" />
+    <PackageReference Include="TorchSharp" Version="0.106.0" />
+    <PackageReference Include="TorchSharp.Fun" Version="0.91.0" />
+  </ItemGroup>
+</Project>
