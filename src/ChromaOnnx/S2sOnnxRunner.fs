@@ -58,6 +58,17 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         else
             None
 
+    let graphExecutionProvider graphName =
+        if normalizedExecutionProvider <> "tensorrt" then
+            normalizedExecutionProvider
+        else
+            match graphName with
+            | "decoder"
+            | "decoder_prefill"
+            | "decoder_step"
+            | "codec_decode" -> "tensorrt"
+            | _ -> "cuda"
+
     let normalizedOptimizedModelCacheFormat =
         match tuningOptions.OptimizedModelCacheFormat.Trim().ToLowerInvariant() with
         | "" | "onnx" -> "onnx"
@@ -72,15 +83,16 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
             GraphOptimizationLevel.ORT_DISABLE_ALL
 
     let cacheKeyForGraph graphName =
+        let provider = graphExecutionProvider graphName
         let extension =
             if normalizedOptimizedModelCacheFormat = "ort" then
                 "optimized.ort"
             else
                 "optimized.onnx"
-        $"{graphName}.{normalizedExecutionProvider}.{normalizedOrtMemoryProfile}.{extension}"
+        $"{graphName}.{provider}.{normalizedOrtMemoryProfile}.{extension}"
 
     let optimizedModelCachePath graphName =
-        if normalizedExecutionProvider = "tensorrt" then
+        if graphExecutionProvider graphName = "tensorrt" then
             None
         else
             optimizedModelCacheDir
@@ -168,7 +180,7 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         // the shared OrtValue views instead of rejecting them as device-memory mismatches.
         if registry.IsSome then
             options.AddSessionConfigEntry("session.use_device_allocator_for_initializers", "0")
-        OrtExecutionProvider.appendToSessionOptions options normalizedExecutionProvider optimizedModelCacheDir useQualitySafeOrtMemoryProfile
+        OrtExecutionProvider.appendToSessionOptions options (graphExecutionProvider graphName) optimizedModelCacheDir useQualitySafeOrtMemoryProfile
         |> ignore
         options, (if cacheExists then existingCachePath.Value else graphPath)
 
@@ -666,6 +678,16 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
 
     member _.TensorRtEngineCacheDir =
         tensorRtEngineCacheDir |> Option.toObj
+
+    member _.GraphExecutionProviders =
+        let names =
+            if graphNames.Length > 0 then
+                graphNames
+            else
+                requiredGraphs
+        names
+        |> Array.map (fun name -> name, graphExecutionProvider name)
+        |> dict
 
     member _.MappedShardCount =
         store

@@ -75,7 +75,7 @@ On this machine, persistent Python Chroma used substantially more host RAM than 
 
 ### Experimental TensorRT Result
 
-TensorRT support is implemented as an experimental execution provider value: `--execution-provider tensorrt` or `--execution-provider trt`. The F# runtime registers TensorRT first and CUDA second as fallback. TensorRT engine caching is enabled under `<optimized-model-cache-dir>/tensorrt-engines`; ORT optimized ONNX serialization is intentionally disabled for TensorRT because the merged Chroma graph exceeds protobuf's 2 GiB model limit during TensorRT partitioning.
+TensorRT support is implemented as an experimental execution provider value: `--execution-provider tensorrt` or `--execution-provider trt`. The current S2S runner treats that as a hybrid route: `generate_prefill`, `backbone_frame_step`, `backbone_thinker_step`, and `s2s_merged` stay on CUDA, while `decoder`, `decoder_prefill`, `decoder_step`, and `codec_decode` use TensorRT with CUDA fallback. TensorRT engine caching is enabled under `<optimized-model-cache-dir>/tensorrt-engines`; ORT optimized ONNX serialization is intentionally disabled for TensorRT graphs because the merged Chroma graph exceeds protobuf's 2 GiB model limit during TensorRT partitioning.
 
 The validated TensorRT runtime install used the Python wheels in the repo venv:
 
@@ -92,10 +92,11 @@ $env:PATH = "E:\s\repos\Chroma_ONNX\.venv\Lib\site-packages\tensorrt_libs;C:\Pro
 Findings on the RTX 3080 Laptop GPU:
 
 - The current merged `resident-merged` graph is not viable for TensorRT. TensorRT/ORT attempts to import a subgraph around `15 GiB` as an ONNX model and crashes at protobuf's 2 GiB limit.
-- A split S2S bundle can run with TensorRT when using `python-footprint` memory mode, but it is much slower than CUDA and creates a very large engine cache.
-- One-frame cached TensorRT split smoke result: total `79.46 s`, prefill `59.40 s`, generate `17.85 s`, decode `2.21 s`, engine cache `21.80 GiB`.
-- One-frame CUDA comparison result: total `2.46 s`, prefill `1.93 s`, generate `0.39 s`, decode `0.14 s`.
-- Output parity for that one-frame comparison was good: code IDs exact, decoded audio allclose at `1e-4`, max absolute diff `8.31e-6`.
+- A split S2S bundle can run with TensorRT when using `python-footprint` memory mode, but it is much slower than CUDA. The earlier full-split TensorRT attempt also created a very large engine cache.
+- Earlier one-frame cached full-split TensorRT smoke result: total `79.46 s`, prefill `59.40 s`, generate `17.85 s`, decode `2.21 s`, engine cache `21.80 GiB`.
+- Option-1 hybrid avoids the thinker audio-tower TensorRT reshape warnings by leaving prefill/backbone on CUDA. It still loses badly: warm one-frame total `85.53 s`, and warm two-frame total `121.45 s` with prefill `74.91 s`, generate `43.57 s`, decode `2.97 s`, clean engine cache `1.33 GiB`.
+- Matched split CUDA two-frame comparison: total `71.15 s`, prefill `58.03 s`, generate `12.41 s`, decode `0.71 s`.
+- Output parity for the two-frame hybrid comparison was good: code IDs exact, decoded audio allclose at `1e-4`, max absolute diff `3.81e-5`.
 
 Because cached TensorRT is already far slower at one frame, the recommended production path remains CUDA `resident-merged`. The next promising optimization is GPU-resident autoregressive state/IO binding rather than deeper TensorRT tuning.
 
