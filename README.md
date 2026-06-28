@@ -2,6 +2,12 @@
 
 This workspace converts `FlashLabs/Chroma-4B` to ONNX and runs it from F# with ONNX Runtime. The current primary path is a Python-free F#/ONNX speech-to-speech service using a single merged, safetensors-backed S2S ONNX bundle.
 
+## License
+
+This repository's own source code is licensed under the MIT License. See `LICENSE`.
+
+Chroma model files, weights, remote model code, tokenizer/processor files, and generated artifacts derived from `FlashLabs/Chroma-4B` are not relicensed here. See `THIRD_PARTY_NOTICES.md` and the upstream Chroma terms before redistributing any model or generated ONNX artifacts.
+
 ## Current Status
 
 - The default tested S2S bundle is `onnx/chroma-s2s-full-v2`.
@@ -318,6 +324,7 @@ Notes for publishing this repo:
 
 - Do not commit `models/chroma-4b/*.safetensors`.
 - Do not commit generated `onnx/chroma-s2s-full-v2` artifacts unless you intentionally want to publish the ONNX metadata/cache.
+- If publishing generated ONNX/model artifacts, include the applicable upstream Chroma notices and comply with the upstream model access terms.
 - The essential reproducible source is the code, scripts, project files, and this README.
 - New users should obtain the gated Chroma weights directly from the upstream Hugging Face repo using their own accepted license/token.
 
