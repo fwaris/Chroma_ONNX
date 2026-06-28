@@ -142,7 +142,10 @@ def main() -> int:
             f"{preview}"
         )
 
-    local_external_path = cache_dir / "chroma_s2s_merged.local_external.onnx"
+    if args.graph == "s2s_merged":
+        local_external_path = cache_dir / "chroma_s2s_merged.local_external.onnx"
+    else:
+        local_external_path = cache_dir / f"{graph_path.stem}.local_external.onnx"
     cache_key_path = cache_dir / (
         f"{args.graph}.{args.provider}.{args.memory_profile}.optimized.onnx"
     )

@@ -1,6 +1,9 @@
 namespace ChromaOnnx
 
+open System
 open System.Collections.Generic
+open System.IO
+open Microsoft.ML.OnnxRuntime
 open Microsoft.ML.OnnxRuntime.Tensors
 
 type ChromaPaths =
@@ -86,3 +89,73 @@ module S2sOrtTuningOptions =
         { MemoryProfile = "quality-safe"
           OptimizedModelCacheDir = None
           OptimizedModelCacheFormat = "onnx" }
+
+module OrtExecutionProvider =
+    let normalize (executionProvider: string) =
+        match executionProvider.Trim().ToLowerInvariant() with
+        | "cuda" -> "cuda"
+        | "cpu" -> "cpu"
+        | "tensorrt" | "trt" -> "tensorrt"
+        | value -> invalidArg (nameof executionProvider) $"Unsupported execution provider '{value}'. Use cuda, cpu, or tensorrt."
+
+    let usesCudaDevice executionProvider =
+        match normalize executionProvider with
+        | "cuda" | "tensorrt" -> true
+        | _ -> false
+
+    let pythonDeviceDefault executionProvider =
+        if usesCudaDevice executionProvider then "cuda" else "cpu"
+
+    let tensorRtEngineCacheDir optimizedModelCacheDir =
+        let root =
+            optimizedModelCacheDir
+            |> Option.defaultWith (fun () ->
+                let localAppData =
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)
+                if String.IsNullOrWhiteSpace localAppData then
+                    Path.Combine(Path.GetTempPath(), "ChromaOnnx")
+                else
+                    Path.Combine(localAppData, "ChromaOnnx"))
+        Path.Combine(root, "tensorrt-engines")
+
+    let appendCuda (options: SessionOptions) qualitySafe =
+        if qualitySafe then
+            let cudaOptions = new OrtCUDAProviderOptions()
+            cudaOptions.UpdateOptions(
+                Dictionary<string, string>(
+                    dict [ "device_id", "0"
+                           "arena_extend_strategy", "kSameAsRequested"
+                           "use_tf32", "0" ]
+                )
+            )
+            options.AppendExecutionProvider_CUDA(cudaOptions)
+            cudaOptions.Dispose()
+        else
+            options.AppendExecutionProvider_CUDA(0)
+
+    let appendToSessionOptions (options: SessionOptions) executionProvider optimizedModelCacheDir qualitySafe =
+        match normalize executionProvider with
+        | "tensorrt" ->
+            let engineCacheDir = tensorRtEngineCacheDir optimizedModelCacheDir
+            Directory.CreateDirectory(engineCacheDir) |> ignore
+            let trtOptions = new OrtTensorRTProviderOptions()
+            trtOptions.UpdateOptions(
+                Dictionary<string, string>(
+                    dict [ "device_id", "0"
+                           "trt_engine_cache_enable", "1"
+                           "trt_engine_cache_path", engineCacheDir
+                           "trt_dump_subgraphs", "0"
+                           "trt_fp16_enable", "0" ]
+                )
+            )
+            options.AppendExecutionProvider_Tensorrt(trtOptions)
+            trtOptions.Dispose()
+            appendCuda options qualitySafe
+            Some engineCacheDir
+        | "cuda" ->
+            appendCuda options qualitySafe
+            None
+        | "cpu" ->
+            options.AppendExecutionProvider_CPU(if qualitySafe then 0 else 1)
+            None
+        | value -> invalidArg (nameof executionProvider) $"Unsupported execution provider '{value}'. Use cuda, cpu, or tensorrt."

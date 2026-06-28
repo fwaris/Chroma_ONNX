@@ -479,6 +479,7 @@ module S2sServe =
                optimizedModelCacheEnabled = runner.OptimizedModelCacheEnabled
                optimizedModelCacheDir = runner.OptimizedModelCacheDir
                optimizedModelCacheFormat = runner.OptimizedModelCacheFormat
+               tensorRtEngineCacheDir = runner.TensorRtEngineCacheDir
                loadedOrtSessions = runner.LoadedSessionNames
                warmOrtSessions = runner.WarmSessionNames
                activePagedOrtSessions = runner.ActivePagedSessionNames
@@ -741,7 +742,7 @@ module S2sServe =
         let thinkerActiveFramesArg = optional "0" "--thinker-active-frames" args
         let thinkerActiveFrames = int thinkerActiveFramesArg
         let python = optional ".venv\\Scripts\\python.exe" "--python" args
-        let pythonDevice = optional (if executionProvider.Equals("cuda", StringComparison.OrdinalIgnoreCase) then "cuda" else "cpu") "--python-device" args
+        let pythonDevice = optional (OrtExecutionProvider.pythonDeviceDefault executionProvider) "--python-device" args
 
         Directory.CreateDirectory(workDir) |> ignore
         let tuningOptions =
@@ -779,6 +780,7 @@ module S2sServe =
                            optimizedModelCacheEnabled = runner.OptimizedModelCacheEnabled
                            optimizedModelCacheDir = runner.OptimizedModelCacheDir
                            optimizedModelCacheFormat = runner.OptimizedModelCacheFormat
+                           tensorRtEngineCacheDir = runner.TensorRtEngineCacheDir
                            memory = RuntimeMemory.current()
                            loadedOrtSessions = runner.LoadedSessionNames
                            warmOrtSessions = runner.WarmSessionNames

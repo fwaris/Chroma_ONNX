@@ -73,6 +73,78 @@ Host RAM observations from the same warm benchmark:
 
 On this machine, persistent Python Chroma used substantially more host RAM than the F#/ONNX resident merged path. Python also reported about `22.53 GiB` of PyTorch CUDA reserved memory after the benchmark. The F#/ONNX benchmark JSON did not capture per-process GPU memory because `nvidia-smi --query-compute-apps` did not expose the process values in this shell, so GPU memory should be checked from Task Manager or `nvidia-smi` during a live run when comparing VRAM/shared GPU pressure.
 
+### Experimental TensorRT Result
+
+TensorRT support is implemented as an experimental execution provider value: `--execution-provider tensorrt` or `--execution-provider trt`. The F# runtime registers TensorRT first and CUDA second as fallback. TensorRT engine caching is enabled under `<optimized-model-cache-dir>/tensorrt-engines`; ORT optimized ONNX serialization is intentionally disabled for TensorRT because the merged Chroma graph exceeds protobuf's 2 GiB model limit during TensorRT partitioning.
+
+The validated TensorRT runtime install used the Python wheels in the repo venv:
+
+```powershell
+.venv\Scripts\python.exe -m pip install --no-deps `
+  tensorrt_cu13_libs==10.13.3.9 `
+  tensorrt_cu13_bindings==10.13.3.9 `
+  tensorrt_cu13==10.13.3.9 `
+  tensorrt==10.13.3.9
+
+$env:PATH = "E:\s\repos\Chroma_ONNX\.venv\Lib\site-packages\tensorrt_libs;C:\Program Files\NVIDIA\CUDNN\v9.23\bin\13.3\x64;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin;$env:PATH"
+```
+
+Findings on the RTX 3080 Laptop GPU:
+
+- The current merged `resident-merged` graph is not viable for TensorRT. TensorRT/ORT attempts to import a subgraph around `15 GiB` as an ONNX model and crashes at protobuf's 2 GiB limit.
+- A split S2S bundle can run with TensorRT when using `python-footprint` memory mode, but it is much slower than CUDA and creates a very large engine cache.
+- One-frame cached TensorRT split smoke result: total `79.46 s`, prefill `59.40 s`, generate `17.85 s`, decode `2.21 s`, engine cache `21.80 GiB`.
+- One-frame CUDA comparison result: total `2.46 s`, prefill `1.93 s`, generate `0.39 s`, decode `0.14 s`.
+- Output parity for that one-frame comparison was good: code IDs exact, decoded audio allclose at `1e-4`, max absolute diff `8.31e-6`.
+
+Because cached TensorRT is already far slower at one frame, the recommended production path remains CUDA `resident-merged`. The next promising optimization is GPU-resident autoregressive state/IO binding rather than deeper TensorRT tuning.
+
+Reproduce the split TensorRT smoke after creating `onnx/chroma-s2s-split-trt` and its local-external cache:
+
+```powershell
+.venv\Scripts\python.exe scripts\export_chroma_onnx.py `
+  --model-dir models/chroma-4b `
+  --output-dir onnx/chroma-s2s-split-trt `
+  --bundle safetensor-shared-s2s `
+  --device cuda `
+  --dtype float32 `
+  --thinker-active-frames 100
+
+$graphs = @(
+  "generate_prefill",
+  "backbone_frame_step",
+  "backbone_thinker_step",
+  "decoder",
+  "decoder_prefill",
+  "decoder_step",
+  "codec_decode"
+)
+foreach ($graph in $graphs) {
+  .venv\Scripts\python.exe scripts\rebuild_chroma_local_external_cache.py `
+    --model-dir models/chroma-4b `
+    --bundle-dir onnx/chroma-s2s-split-trt `
+    --cache-dir onnx/chroma-s2s-split-trt/ort-cache-ort-local-external `
+    --graph $graph `
+    --provider tensorrt `
+    --memory-profile quality-safe
+}
+
+dotnet run --project src\ChromaOnnx -- s2s-offline `
+  --model-dir models/chroma-4b `
+  --bundle-dir onnx/chroma-s2s-split-trt `
+  --prompt-text "War" `
+  --prompt-audio-f32 served_runs/compare_inputs/reference_audio_24k.f32 `
+  --user-audio-f32 served_runs/compare_inputs/make_taco_16k.f32 `
+  --frames 1 `
+  --output-dir served_runs/smoke/fsharp_tensorrt_split_1f `
+  --execution-provider tensorrt `
+  --memory-mode python-footprint `
+  --ort-memory-profile quality-safe `
+  --thinker-active-frames 0 `
+  --optimized-model-cache-dir onnx/chroma-s2s-split-trt/ort-cache-ort-local-external `
+  --optimized-model-cache-format onnx
+```
+
 Reproduce the F#/ONNX benchmark:
 
 ```powershell

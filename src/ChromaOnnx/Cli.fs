@@ -77,6 +77,14 @@ module Cli =
             | _ -> None)
         |> summarizeMilliseconds
 
+    let private directorySizeBytes (path: string | null) =
+        match path with
+        | null -> 0L
+        | value when String.IsNullOrWhiteSpace value || not (Directory.Exists value) -> 0L
+        | value ->
+            Directory.EnumerateFiles(value, "*", SearchOption.AllDirectories)
+            |> Seq.sumBy (fun file -> FileInfo(file).Length)
+
     let private paths args =
         let onnxDir = required "--onnx-dir" args
         { OnnxDir = onnxDir
@@ -103,6 +111,7 @@ module Cli =
         printfn "  ChromaOnnx serve --model-dir models/chroma-4b --bundle-dir onnx/chroma-shared --work-dir served_runs --port 5055 --python .venv/Scripts/python.exe"
         printfn "  ChromaOnnx s2s-serve --model-dir models/chroma-4b --bundle-dir onnx/chroma-s2s --work-dir served_runs --port 5055 --execution-provider cuda --memory-mode resident-merged --ort-memory-profile quality-safe --thinker-active-frames 0 --optimized-model-cache-dir onnx/chroma-s2s/ort-cache --optimized-model-cache-format onnx --python .venv/Scripts/python.exe --python-device cuda"
         printfn "  ChromaOnnx s2s-offline --model-dir models/chroma-4b --bundle-dir onnx/chroma-s2s --prompt-text text --prompt-audio-f32 reference_24k.f32 --user-audio-f32 turn_16k.f32 --frames 8 --output-dir served_runs/offline/fsharp --execution-provider cuda --memory-mode resident-merged --ort-memory-profile quality-safe --thinker-active-frames 0"
+        printfn "  ChromaOnnx s2s-offline --model-dir models/chroma-4b --bundle-dir onnx/chroma-s2s-split-trt --prompt-text text --prompt-audio-f32 reference_24k.f32 --user-audio-f32 turn_16k.f32 --frames 1 --output-dir served_runs/smoke/fsharp_tensorrt --execution-provider tensorrt --memory-mode python-footprint --ort-memory-profile quality-safe --thinker-active-frames 0 --optimized-model-cache-dir onnx/chroma-s2s-split-trt/ort-cache-ort-local-external --optimized-model-cache-format onnx"
         printfn "  ChromaOnnx s2s-debug-onnx --model-dir models/chroma-4b --bundle-dir onnx/chroma-s2s --prepared-dir served_runs/debug/prepared --output-dir served_runs/debug/onnx --execution-provider cuda --memory-mode resident-merged --ort-memory-profile quality-safe"
         printfn "  ChromaOnnx s2s-benchmark --model-dir models/chroma-4b --bundle-dir onnx/chroma-s2s --prompt-text text --prompt-audio-f32 reference_24k.f32 --user-audio-f32 turn_16k.f32 --frames 8 --warmup 1 --iterations 5 --output-dir served_runs/bench/fsharp --execution-provider cuda --memory-mode resident-merged --ort-memory-profile quality-safe --thinker-active-frames 0"
         printfn "  ChromaOnnx s2s-compare --model-dir models/chroma-4b --bundle-dir onnx/chroma-s2s --prompt-text text --prompt-audio reference.wav --user-audio turn.wav --output-dir served_runs/compare --python .venv/Scripts/python.exe --execution-provider cuda --memory-mode resident-merged --ort-memory-profile quality-safe [--thinker-active-frames 0]"
@@ -271,23 +280,8 @@ module Cli =
         if qualitySafe then
             options.EnableCpuMemArena <- false
             options.EnableMemoryPattern <- false
-        match executionProvider.Trim().ToLowerInvariant() with
-        | "cuda" ->
-            if qualitySafe then
-                let cudaOptions = new OrtCUDAProviderOptions()
-                cudaOptions.UpdateOptions(
-                    Dictionary<string, string>(
-                        dict [ "device_id", "0"
-                               "arena_extend_strategy", "kSameAsRequested"
-                               "use_tf32", "0" ]
-                    )
-                )
-                options.AppendExecutionProvider_CUDA(cudaOptions)
-                cudaOptions.Dispose()
-            else
-                options.AppendExecutionProvider_CUDA(0)
-        | "cpu" -> options.AppendExecutionProvider_CPU(if qualitySafe then 0 else 1)
-        | value -> invalidArg "--execution-provider" $"Unsupported execution provider '{value}'. Use cuda or cpu."
+        OrtExecutionProvider.appendToSessionOptions options executionProvider tuningOptions.OptimizedModelCacheDir qualitySafe
+        |> ignore
         options
 
     let codecEncodeOnnxDebug args =
@@ -369,7 +363,9 @@ module Cli =
 
         let stopwatch = Stopwatch.StartNew()
         let memoryBefore = RuntimeMemory.current()
+        let runnerLoadStopwatch = Stopwatch.StartNew()
         use runner = new ChromaS2sOnnxRunner(modelDir, bundleDir, executionProvider, memoryMode, tuningOptions)
+        runnerLoadStopwatch.Stop()
         let memoryAfterLoad = RuntimeMemory.current()
         let result = runner.Generate(prepared, frames)
         let memoryAfterGenerate = RuntimeMemory.current()
@@ -389,6 +385,8 @@ module Cli =
                optimizedModelCacheEnabled = runner.OptimizedModelCacheEnabled
                optimizedModelCacheDir = runner.OptimizedModelCacheDir
                optimizedModelCacheFormat = runner.OptimizedModelCacheFormat
+               tensorRtEngineCacheDir = runner.TensorRtEngineCacheDir
+               tensorRtEngineCacheBytes = directorySizeBytes runner.TensorRtEngineCacheDir
                loadedOrtSessions = runner.LoadedSessionNames
                warmOrtSessions = runner.WarmSessionNames
                activePagedOrtSessions = runner.ActivePagedSessionNames
@@ -417,6 +415,7 @@ module Cli =
                audioCodesShape = result.AudioCodes.Dimensions.ToArray()
                audioValuesShape = result.AudioValues.Dimensions.ToArray()
                timingsMs = result.Timings
+               runnerLoadMs = runnerLoadStopwatch.Elapsed.TotalMilliseconds
                wallClockMs = stopwatch.Elapsed.TotalMilliseconds
                wav = wavStats |}
         let detailsJson =
@@ -466,7 +465,9 @@ module Cli =
         File.Copy(userAudioPath, Path.Combine(outputDir, "user_audio_16k.f32"), true)
 
         let memoryBeforeCreate = RuntimeMemory.current()
+        let runnerCreateStopwatch = Stopwatch.StartNew()
         use runner = new ChromaS2sOnnxRunner(modelDir, bundleDir, executionProvider, memoryMode, tuningOptions)
+        runnerCreateStopwatch.Stop()
         let memoryAfterCreate = RuntimeMemory.current()
 
         for warmupIndex in 1 .. warmup do
@@ -517,6 +518,8 @@ module Cli =
                optimizedModelCacheEnabled = runner.OptimizedModelCacheEnabled
                optimizedModelCacheDir = runner.OptimizedModelCacheDir
                optimizedModelCacheFormat = runner.OptimizedModelCacheFormat
+               tensorRtEngineCacheDir = runner.TensorRtEngineCacheDir
+               tensorRtEngineCacheBytes = directorySizeBytes runner.TensorRtEngineCacheDir
                loadedOrtSessions = runner.LoadedSessionNames
                warmOrtSessions = runner.WarmSessionNames
                activePagedOrtSessions = runner.ActivePagedSessionNames
@@ -542,6 +545,7 @@ module Cli =
                       prefillMs = summarizeTimingKey "prefillMs" iterations
                       generateMs = summarizeTimingKey "generateMs" iterations
                       decodeMs = summarizeTimingKey "decodeMs" iterations |}
+               sessionCreateMs = runnerCreateStopwatch.Elapsed.TotalMilliseconds
                benchmarkWallClockMs = benchmarkStopwatch.Elapsed.TotalMilliseconds
                iterations =
                    iterations
@@ -732,7 +736,7 @@ module Cli =
         let executionProvider = optional "cuda" "--execution-provider" args
         let memoryMode = optional "python-footprint" "--memory-mode" args
         let tuningOptions = s2sTuningOptions args
-        let pythonDevice = optional (if executionProvider.Equals("cuda", StringComparison.OrdinalIgnoreCase) then "cuda" else "cpu") "--python-device" args
+        let pythonDevice = optional (OrtExecutionProvider.pythonDeviceDefault executionProvider) "--python-device" args
         let thinkerActiveFrames = optional "0" "--thinker-active-frames" args
         let thinkerActiveFrameCount = int thinkerActiveFrames
         let pythonDir = Path.Combine(outputDir, "python")
@@ -816,6 +820,8 @@ module Cli =
                        optimizedModelCacheEnabled = runner.OptimizedModelCacheEnabled
                        optimizedModelCacheDir = runner.OptimizedModelCacheDir
                        optimizedModelCacheFormat = runner.OptimizedModelCacheFormat
+                       tensorRtEngineCacheDir = runner.TensorRtEngineCacheDir
+                       tensorRtEngineCacheBytes = directorySizeBytes runner.TensorRtEngineCacheDir
                        requestedFrames = frames
                        frameCount = result.FrameCount
                        stopReason = result.StopReason
@@ -905,7 +911,7 @@ module Cli =
         let frames = optional "8" "--frames" args |> int
         let thinkerActiveFrames = optional "0" "--thinker-active-frames" args
         let thinkerActiveFrameCount = int thinkerActiveFrames
-        let pythonDevice = if executionProvider.Equals("cuda", StringComparison.OrdinalIgnoreCase) then "cuda" else "cpu"
+        let pythonDevice = OrtExecutionProvider.pythonDeviceDefault executionProvider
         let pythonTraceDir = Path.Combine(outputDir, "python_trace")
         let onnxDebugDir = Path.Combine(outputDir, "onnx_debug")
         let scriptPath = Path.Combine(Directory.GetCurrentDirectory(), "scripts", "chroma_s2s_step_debug.py")

@@ -28,6 +28,8 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         else
             None
 
+    let normalizedExecutionProvider = OrtExecutionProvider.normalize executionProvider
+
     let normalizedMemoryMode =
         match memoryMode.Trim().ToLowerInvariant() with
         | "" | "python-footprint" | "python_footprint" | "paged" | "memory" -> "python-footprint"
@@ -50,6 +52,12 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         tuningOptions.OptimizedModelCacheDir
         |> Option.map (fun path -> Path.GetFullPath(path))
 
+    let tensorRtEngineCacheDir =
+        if normalizedExecutionProvider = "tensorrt" then
+            Some(OrtExecutionProvider.tensorRtEngineCacheDir optimizedModelCacheDir)
+        else
+            None
+
     let normalizedOptimizedModelCacheFormat =
         match tuningOptions.OptimizedModelCacheFormat.Trim().ToLowerInvariant() with
         | "" | "onnx" -> "onnx"
@@ -64,17 +72,19 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
             GraphOptimizationLevel.ORT_DISABLE_ALL
 
     let cacheKeyForGraph graphName =
-        let provider = executionProvider.Trim().ToLowerInvariant()
         let extension =
             if normalizedOptimizedModelCacheFormat = "ort" then
                 "optimized.ort"
             else
                 "optimized.onnx"
-        $"{graphName}.{provider}.{normalizedOrtMemoryProfile}.{extension}"
+        $"{graphName}.{normalizedExecutionProvider}.{normalizedOrtMemoryProfile}.{extension}"
 
     let optimizedModelCachePath graphName =
-        optimizedModelCacheDir
-        |> Option.map (fun dir -> Path.Combine(dir, cacheKeyForGraph graphName))
+        if normalizedExecutionProvider = "tensorrt" then
+            None
+        else
+            optimizedModelCacheDir
+            |> Option.map (fun dir -> Path.Combine(dir, cacheKeyForGraph graphName))
 
     let existingOptimizedModelCachePath graphName =
         optimizedModelCachePath graphName
@@ -158,23 +168,8 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         // the shared OrtValue views instead of rejecting them as device-memory mismatches.
         if registry.IsSome then
             options.AddSessionConfigEntry("session.use_device_allocator_for_initializers", "0")
-        match executionProvider.Trim().ToLowerInvariant() with
-        | "cuda" ->
-            if useQualitySafeOrtMemoryProfile then
-                let cudaOptions = new OrtCUDAProviderOptions()
-                cudaOptions.UpdateOptions(
-                    Dictionary<string, string>(
-                        dict [ "device_id", "0"
-                               "arena_extend_strategy", "kSameAsRequested"
-                               "use_tf32", "0" ]
-                    )
-                )
-                options.AppendExecutionProvider_CUDA(cudaOptions)
-                cudaOptions.Dispose()
-            else
-                options.AppendExecutionProvider_CUDA(0)
-        | "cpu" -> options.AppendExecutionProvider_CPU(if useQualitySafeOrtMemoryProfile then 0 else 1)
-        | value -> invalidArg (nameof executionProvider) $"Unsupported execution provider '{value}'. Use cuda or cpu."
+        OrtExecutionProvider.appendToSessionOptions options normalizedExecutionProvider optimizedModelCacheDir useQualitySafeOrtMemoryProfile
+        |> ignore
         options, (if cacheExists then existingCachePath.Value else graphPath)
 
     let shouldKeepWarm graphName =
@@ -187,6 +182,29 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
             || graphName = "codec_decode"
         | _ -> false
 
+    let resolveGraphPath (path: string) =
+        if File.Exists path then
+            path
+        else
+            match Path.GetFileName(path) with
+            | null -> path
+            | fileName when String.IsNullOrWhiteSpace fileName -> path
+            | fileName ->
+                let localPath = Path.Combine(bundleDir, fileName)
+                if File.Exists localPath then localPath else path
+
+    let sourceGraphPath graphName path =
+        let resolvedPath = resolveGraphPath path
+        let localExternalName =
+            if graphName = mergedGraphName then
+                "chroma_s2s_merged.local_external.onnx"
+            else
+                $"{Path.GetFileNameWithoutExtension(resolvedPath)}.local_external.onnx"
+        optimizedModelCacheDir
+        |> Option.map (fun dir -> Path.Combine(dir, localExternalName))
+        |> Option.filter File.Exists
+        |> Option.defaultValue resolvedPath
+
     let createSession graphName =
         match manifest with
         | None -> invalidOp $"S2S bundle manifest was not found: {manifestPath}"
@@ -194,10 +212,11 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
             match value.Graphs.TryGetValue(graphName) with
             | false, _ -> invalidArg (nameof graphName) $"S2S bundle does not contain graph {graphName}."
             | true, graph ->
-                if not (File.Exists graph.Path) then
+                let graphPath = sourceGraphPath graphName graph.Path
+                if not (File.Exists graphPath) then
                     invalidArg graphName $"S2S ONNX graph was not found: {graph.Path}"
 
-                let options, sessionPath = createOptions graphName graph.Path
+                let options, sessionPath = createOptions graphName graphPath
                 registry
                 |> Option.iter (fun registryValue ->
                     if graphName = mergedGraphName then
@@ -631,7 +650,7 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
           Bundle = bundle
           MissingGraphs = missingGraphs
           AvailableGraphs = graphNames
-          ExecutionProvider = executionProvider
+          ExecutionProvider = normalizedExecutionProvider
           Message = message }
 
     member _.MemoryMode = normalizedMemoryMode
@@ -644,6 +663,9 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
     member _.OptimizedModelCacheEnabled = optimizedModelCacheDir.IsSome
 
     member _.OptimizedModelCacheFormat = normalizedOptimizedModelCacheFormat
+
+    member _.TensorRtEngineCacheDir =
+        tensorRtEngineCacheDir |> Option.toObj
 
     member _.MappedShardCount =
         store
