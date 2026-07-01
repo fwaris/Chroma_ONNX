@@ -5,7 +5,7 @@ open System.Collections.Concurrent
 open System.Collections.Generic
 open System.Diagnostics
 open System.IO
-open System.Linq
+open System.Runtime.InteropServices
 open System.Text.Json
 open Microsoft.ML.OnnxRuntime
 open Microsoft.ML.OnnxRuntime.Tensors
@@ -499,26 +499,93 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
 
         ids
 
-    let frameToInputIds (frame: DenseTensor<int64>) =
-        let data = Enumerable.ToArray(frame)
-        DenseTensor<int64>(data, [| 1; 1; audioNumCodebooks |])
+    let validateAudioFrame (frame: DenseTensor<int64>) =
+        let dims = frame.Dimensions
+        if dims.Length <> 2 || dims[0] <> 1 || dims[1] <> audioNumCodebooks then
+            invalidArg (nameof frame) $"Expected audio frame shape [1, {audioNumCodebooks}]."
 
-    let appendFrame (frames: ResizeArray<int64 array>) (frame: DenseTensor<int64>) =
-        frames.Add(Enumerable.ToArray(frame))
+    let copyFrameToSpan (frame: DenseTensor<int64>) (destination: Span<int64>) =
+        validateAudioFrame frame
+        if destination.Length < audioNumCodebooks then
+            invalidArg (nameof destination) $"Destination must have room for {audioNumCodebooks} codebooks."
+
+        let source = frame.Buffer.Span
+        let strides = frame.Strides
+
+        if strides[1] = 1 then
+            source.Slice(0, audioNumCodebooks).CopyTo(destination)
+        else
+            for codebookIndex in 0 .. audioNumCodebooks - 1 do
+                destination[codebookIndex] <- source[codebookIndex * strides[1]]
+
+    let frameToInputIds (frame: DenseTensor<int64>) =
+        validateAudioFrame frame
+        let strides = frame.Strides
+        let dimensions = [| 1; 1; audioNumCodebooks |]
+
+        if strides[0] = audioNumCodebooks && strides[1] = 1 then
+            DenseTensor<int64>(frame.Buffer, ReadOnlySpan<int>(dimensions), false)
+        else
+            let values = Array.zeroCreate<int64> audioNumCodebooks
+            copyFrameToSpan frame (values.AsSpan())
+            DenseTensor<int64>(values, dimensions)
+
+    let appendFrame (frames: ResizeArray<int64>) (frame: DenseTensor<int64>) =
+        let frameStart = frames.Count
+        for _ in 1 .. audioNumCodebooks do
+            frames.Add(0L)
+        copyFrameToSpan frame (CollectionsMarshal.AsSpan(frames).Slice(frameStart, audioNumCodebooks))
 
     let frameIsEos (frame: DenseTensor<int64>) =
-        let values = Enumerable.ToArray(frame)
+        validateAudioFrame frame
+        let values = frame.Buffer.Span
+        let strides = frame.Strides
         let checkedCount = max 1 (audioNumCodebooks - 1)
-        values.Length >= checkedCount
-        && values |> Seq.take checkedCount |> Seq.forall ((=) 0L)
+        let mutable isEos = true
+        let mutable codebookIndex = 0
 
-    let framesToCodecTensor (frames: ResizeArray<int64 array>) =
-        let frameCount = frames.Count
+        while isEos && codebookIndex < checkedCount do
+            if values[codebookIndex * strides[1]] <> 0L then
+                isEos <- false
+            codebookIndex <- codebookIndex + 1
+
+        isEos
+
+    let frameHasAnyNonZero (frame: DenseTensor<int64>) =
+        validateAudioFrame frame
+        let values = frame.Buffer.Span
+        let strides = frame.Strides
+        let mutable found = false
+        let mutable codebookIndex = 0
+
+        while not found && codebookIndex < audioNumCodebooks do
+            if values[codebookIndex * strides[1]] <> 0L then
+                found <- true
+            codebookIndex <- codebookIndex + 1
+
+        found
+
+    let tensorContainsInt64 value (tensor: DenseTensor<int64>) =
+        let values = tensor.Buffer.Span
+        let mutable found = false
+        let mutable index = 0
+
+        while not found && index < values.Length do
+            if values[index] = value then
+                found <- true
+            index <- index + 1
+
+        found
+
+    let frameCount (frames: ResizeArray<int64>) =
+        frames.Count / audioNumCodebooks
+
+    let framesToCodecTensor (frames: ResizeArray<int64>) =
+        let frameCount = frameCount frames
         let values = Array.zeroCreate<int64> (audioNumCodebooks * frameCount)
         for frameIndex in 0 .. frameCount - 1 do
-            let frame = frames[frameIndex]
             for codebookIndex in 0 .. audioNumCodebooks - 1 do
-                values[codebookIndex * frameCount + frameIndex] <- frame[codebookIndex]
+                values[codebookIndex * frameCount + frameIndex] <- frames[(frameIndex * audioNumCodebooks) + codebookIndex]
         DenseTensor<int64>(values, [| 1; audioNumCodebooks; frameCount |])
 
     let runCodecDecode (audioCodes: DenseTensor<int64>) =
@@ -756,10 +823,7 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         writeDebugInt64 outputDir infos "trace_state_0_thinker_eos" traceState.ThinkerEos
 
         for frameIndex in 1 .. max 0 (maxDebugFrames - 1) do
-            let thinkerActive =
-                traceState.ThinkerEos
-                |> Enumerable.ToArray
-                |> Array.exists ((=) 0L)
+            let thinkerActive = tensorContainsInt64 0L traceState.ThinkerEos
             let stepKind, traceStep =
                 if traceUseThinker && thinkerActive then
                     traceUseThinker <- false
@@ -800,7 +864,7 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         let prefill = runGeneratePrefill prepared
         timings["prefillMs"] <- stopwatch.Elapsed.TotalMilliseconds
 
-        let frames = ResizeArray<int64 array>()
+        let frames = ResizeArray<int64>(maxNewFrames * audioNumCodebooks)
         let stepKinds = ResizeArray<string>()
         let mutable current = greedyAudioFrame prefill.Logits prefill.HiddenStates
         appendFrame frames current
@@ -810,20 +874,20 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         let mutable stopReason = if frameIsEos current then "eos" else "max_frames"
         let mutable useThinker = false
 
-        while frames.Count < maxNewFrames && stopReason <> "eos" do
+        while frameCount frames < maxNewFrames && stopReason <> "eos" do
             let mutable stepKind = "frame"
             let step =
-                if useThinker && state.ThinkerEos |> Enumerable.ToArray |> Array.exists ((=) 0L) then
+                if useThinker && tensorContainsInt64 0L state.ThinkerEos then
                     useThinker <- false
                     stepKind <- "thinker"
                     runBackboneThinkerStep currentInput state
                 else
-                    useThinker <- state.ThinkerEos |> Enumerable.ToArray |> Array.exists ((=) 0L)
+                    useThinker <- tensorContainsInt64 0L state.ThinkerEos
                     runBackboneFrameStep currentInput state
 
             state <- step.State
             current <- greedyAudioFrame step.Logits step.HiddenStates
-            if not (current |> Enumerable.ToArray |> Array.forall ((=) 0L)) then
+            if frameHasAnyNonZero current then
                 appendFrame frames current
                 stepKinds.Add(stepKind)
             currentInput <- frameToInputIds current
@@ -839,7 +903,7 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
 
         { AudioCodes = codes
           AudioValues = audio
-          FrameCount = frames.Count
+          FrameCount = frameCount frames
           StopReason = stopReason
           StepKinds = stepKinds.ToArray()
           Timings = timings }
