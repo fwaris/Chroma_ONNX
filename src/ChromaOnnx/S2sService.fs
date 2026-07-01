@@ -87,6 +87,7 @@ module S2sServe =
     .audioResults { display: grid; gap: 12px; }
     .audioResult { display: grid; gap: 6px; }
     .audioResult strong { font-size: 13px; color: #52606d; }
+    .timing { font-size: 13px; color: #52606d; }
     @media (max-width: 780px) { main { grid-template-columns: 1fr; } form { border-right: 0; border-bottom: 1px solid #d7dde3; } }
   </style>
 </head>
@@ -140,6 +141,21 @@ module S2sServe =
       return `${url}${url.includes('?') ? '&' : '?'}v=${Date.now()}`;
     }
 
+    function formatDuration(ms) {
+      if (!Number.isFinite(ms)) return '';
+      return ms >= 1000 ? `${(ms / 1000).toFixed(ms >= 10000 ? 1 : 2)} s` : `${Math.round(ms)} ms`;
+    }
+
+    function timingText(result) {
+      const timings = result.timingsMs || {};
+      const parts = [];
+      if (Number.isFinite(timings.totalMs)) parts.push(`end-to-end ${formatDuration(timings.totalMs)}`);
+      if (Number.isFinite(timings.prefillMs)) parts.push(`prefill ${formatDuration(timings.prefillMs)}`);
+      if (Number.isFinite(timings.generateMs)) parts.push(`generate ${formatDuration(timings.generateMs)}`);
+      if (Number.isFinite(timings.decodeMs)) parts.push(`decode ${formatDuration(timings.decodeMs)}`);
+      return parts.join(' | ');
+    }
+
     function renderBackendResults(results) {
       audio.hidden = true;
       audio.removeAttribute('src');
@@ -150,6 +166,10 @@ module S2sServe =
 
         const label = document.createElement('strong');
         label.textContent = result.label || result.backend || 'Result';
+
+        const timing = document.createElement('div');
+        timing.className = 'timing';
+        timing.textContent = timingText(result);
 
         const player = document.createElement('audio');
         player.controls = true;
@@ -171,7 +191,9 @@ module S2sServe =
           links.append(detailLink);
         }
 
-        block.append(label, player, links);
+        block.append(label);
+        if (timing.textContent) block.append(timing);
+        block.append(player, links);
         audioResults.append(block);
       }
     }
@@ -267,9 +289,13 @@ module S2sServe =
         const ws = new WebSocket(`${location.origin.replace('http', 'ws')}/ws/s2s/${session.id}`);
         currentSocket = ws;
         ws.binaryType = 'arraybuffer';
+        let generationStartedAt = 0;
         ws.onmessage = event => {
           const payload = JSON.parse(event.data);
           details.textContent = JSON.stringify(payload, null, 2);
+          if (payload.type === 'generation.started') {
+            generationStartedAt = performance.now();
+          }
           if (payload.type === 'generation.done' && Array.isArray(payload.results)) {
             renderBackendResults(payload.results);
           } else if (payload.type === 'generation.done' && payload.audioUrl) {
@@ -282,7 +308,12 @@ module S2sServe =
             finish();
             if (ws.readyState === WebSocket.OPEN) ws.close(1000, 'error handled');
           } else {
-            message.textContent = payload.type;
+            const elapsedMs = payload.type === 'generation.done' && generationStartedAt > 0
+              ? performance.now() - generationStartedAt
+              : NaN;
+            message.textContent = payload.type === 'generation.done' && Number.isFinite(elapsedMs)
+              ? `generation.done - page end-to-end ${formatDuration(elapsedMs)}`
+              : payload.type;
             message.className = 'status';
             if (payload.type === 'generation.done') {
               finish();

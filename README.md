@@ -25,7 +25,7 @@ Memory note: `resident-merged` keeps the single merged ORT session loaded for lo
 
 ## Performance Comparison
 
-> The F#-ONNX version is 5X faster than Python-PyTorch on the GTX 3080 16GB and consumes much less OS memory. Why? [See this analysis](/performance_analysis/chroma_onnx_runtime_performance_analysis.md)
+> The F#-ONNX version is roughly 6X faster than Python-PyTorch on the GTX 3080 16GB and consumes much less OS memory. Why? [See this analysis](/performance_analysis/chroma_onnx_runtime_performance_analysis.md)
 
 The latest warm-generation benchmark compares persistent Python Chroma CUDA against persistent F#/ONNX CUDA on the same fixture. Model load, ONNX session creation, safetensor mapping, processor setup, and warmup requests are excluded. The benchmark is intended to represent a server process that is already loaded and receiving requests one after another.
 
@@ -60,8 +60,15 @@ Warm generation time:
 
 | Requested frames | Python Chroma CUDA mean | F#/ONNX CUDA mean | F#/ONNX split | Speedup |
 | ---: | ---: | ---: | --- | ---: |
-| 8 | `21.97 s` | `3.63 s` | prefill `0.49 s`, generate `3.11 s`, decode `0.04 s` | `~6.0x` |
-| 32 | `65.12 s` | `13.65 s` | prefill `0.49 s`, generate `13.12 s`, decode `0.04 s` | `~4.8x` |
+| 8 | `21.97 s` | `2.97 s` | prefill `0.40 s`, generate `2.54 s`, decode `0.03 s` | `~7.4x` |
+| 32 | `65.12 s` | `11.18 s` | prefill `0.39 s`, generate `10.76 s`, decode `0.03 s` | `~5.8x` |
+
+Recent F#/ONNX allocation and active-frame updates improved the warm CUDA path versus the previous recorded F#/ONNX benchmark:
+
+| Requested frames | Previous F#/ONNX mean | Latest F#/ONNX mean | Change |
+| ---: | ---: | ---: | ---: |
+| 8 | `3.63 s` | `2.97 s` | `-18.2%` |
+| 32 | `13.65 s` | `11.18 s` | `-18.1%` |
 
 Output parity for the measured artifacts:
 
@@ -75,9 +82,9 @@ Host RAM observations from the same warm benchmark:
 | Requested frames | Backend | Working set after benchmark | Private bytes after benchmark |
 | ---: | --- | ---: | ---: |
 | 8 | Python Chroma CUDA | `26.88 GiB` | `45.76 GiB` |
-| 8 | F#/ONNX CUDA | `2.35 GiB` | `18.23 GiB` |
+| 8 | F#/ONNX CUDA | `2.15 GiB` | `17.93 GiB` |
 | 32 | Python Chroma CUDA | `26.88 GiB` | `45.77 GiB` |
-| 32 | F#/ONNX CUDA | `2.40 GiB` | `18.27 GiB` |
+| 32 | F#/ONNX CUDA | `2.11 GiB` | `17.95 GiB` |
 
 On this machine, persistent Python Chroma used substantially more host RAM than the F#/ONNX resident merged path. Python also reported about `22.53 GiB` of PyTorch CUDA reserved memory after the benchmark. The F#/ONNX benchmark JSON did not capture per-process GPU memory because `nvidia-smi --query-compute-apps` did not expose the process values in this shell, so GPU memory should be checked from Task Manager or `nvidia-smi` during a live run when comparing VRAM/shared GPU pressure.
 
