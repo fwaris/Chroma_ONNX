@@ -176,10 +176,6 @@ type ChromaNativeProcessor(modelDir: string, ?thinkerActiveFrames: int) =
 
     let extractThinkerFeatures (pcm16k: float32 array) =
         let sampleCount = min pcm16k.Length thinkerMaxSamples
-        let padded = Array.zeroCreate<float32> thinkerMaxSamples
-        if sampleCount > 0 then
-            Array.Copy(pcm16k, padded, sampleCount)
-
         let activeFrames =
             if sampleCount <= 0 then
                 0
@@ -187,35 +183,53 @@ type ChromaNativeProcessor(modelDir: string, ?thinkerActiveFrames: int) =
                 min thinkerMaxFrames (((sampleCount - 1) / thinkerHopLength) + 1)
 
         let activeFramesForExport = min activeFrames thinkerActiveFrameLimit
+        let featureValues = Array.zeroCreate<float32> (audioFeatureSize * thinkerMaxFrames)
 
         let mask =
             Array.init thinkerMaxFrames (fun frameIndex -> if frameIndex < activeFramesForExport then 1L else 0L)
 
-        use waveform = torch.tensor(padded, dtype = Nullable(torch.float32))
-        use window = torch.hann_window(int64 thinkerNfft, dtype = Nullable(torch.float32))
-        use stft =
-            torch.stft(
-                waveform,
-                int64 thinkerNfft,
-                hop_length = int64 thinkerHopLength,
-                win_length = int64 thinkerNfft,
-                window = window,
-                center = true,
-                normalized = false,
-                onesided = true,
-                return_complex = true
-            )
-        use magnitude = stft.abs()
-        use powerSpectrum = magnitude * magnitude
-        use melFilters =
-            torch
-                .tensor(melFilterBank.Value, dtype = Nullable(torch.float32))
-                .reshape([| int64 audioFeatureSize; int64 melFrequencyBins |])
-        use melSpectrum = torch.matmul(melFilters, powerSpectrum).clamp_min(1e-10).log10()
-        use trimmed = melSpectrum.narrow(1L, 0L, int64 thinkerMaxFrames)
-        use floor = torch.maximum(trimmed, trimmed.max() - 8.0)
-        use normalized = (floor + 4.0) / 4.0
-        let featureValues = normalized.contiguous().data<float32>().ToArray()
+        if activeFramesForExport > 0 then
+            let framesToCompute = activeFrames
+            let samplesNeededForComputedFrames = min sampleCount (framesToCompute * thinkerHopLength)
+            let workingSampleCount = max 1 (min thinkerMaxSamples (samplesNeededForComputedFrames + thinkerNfft))
+            let workingPcm = Array.zeroCreate<float32> workingSampleCount
+            if sampleCount > 0 then
+                Array.Copy(pcm16k, workingPcm, min sampleCount workingSampleCount)
+
+            use waveform = torch.tensor(workingPcm, dtype = Nullable(torch.float32))
+            use window = torch.hann_window(int64 thinkerNfft, dtype = Nullable(torch.float32))
+            use stft =
+                torch.stft(
+                    waveform,
+                    int64 thinkerNfft,
+                    hop_length = int64 thinkerHopLength,
+                    win_length = int64 thinkerNfft,
+                    window = window,
+                    center = true,
+                    normalized = false,
+                    onesided = true,
+                    return_complex = true
+                )
+            use magnitude = stft.abs()
+            use powerSpectrum = magnitude * magnitude
+            use melFilters =
+                torch
+                    .tensor(melFilterBank.Value, dtype = Nullable(torch.float32))
+                    .reshape([| int64 audioFeatureSize; int64 melFrequencyBins |])
+            use melSpectrum = torch.matmul(melFilters, powerSpectrum).clamp_min(1e-10).log10()
+            use trimmed = melSpectrum.narrow(1L, 0L, int64 framesToCompute)
+            use floor = torch.maximum(trimmed, trimmed.max() - 8.0)
+            use normalized = (floor + 4.0) / 4.0
+            let activeFeatureValues = normalized.contiguous().data<float32>().ToArray()
+
+            for featureIndex in 0 .. audioFeatureSize - 1 do
+                Array.Copy(
+                    activeFeatureValues,
+                    featureIndex * framesToCompute,
+                    featureValues,
+                    featureIndex * thinkerMaxFrames,
+                    activeFramesForExport
+                )
 
         DenseTensor<float32>(featureValues, [| 1; audioFeatureSize; thinkerMaxFrames |]),
         DenseTensor<int64>(mask, [| 1; thinkerMaxFrames |]),
