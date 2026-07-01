@@ -5,7 +5,6 @@ open System.IO
 open System.Linq
 open System.Text.Json
 open Microsoft.ML.OnnxRuntime.Tensors
-open TorchSharp
 
 module TensorIO =
     let private expectedBytes<'T> count =
@@ -80,63 +79,90 @@ module Manifest =
             { HiddenSize = tryGetInt "hidden_size" doc.RootElement
               AudioNumCodebooks = tryGetInt "audio_num_codebooks" doc.RootElement }
 
-module TorchTensor =
-    let private shape (dims: int array) =
-        dims |> Array.map int64
-
-    let fromDenseFloat (tensor: DenseTensor<float32>) =
-        let data = Enumerable.ToArray(tensor)
-        torch.tensor(data, dtype = Nullable(torch.float32)).reshape(shape (tensor.Dimensions.ToArray()))
-
-    let fromDenseInt64 (tensor: DenseTensor<int64>) =
-        let data = Enumerable.ToArray(tensor)
-        torch.tensor(data, dtype = Nullable(torch.int64)).reshape(shape (tensor.Dimensions.ToArray()))
-
-    let toDenseFloat (tensor: torch.Tensor) (dims: int array) =
-        use contiguous = tensor.contiguous()
-        DenseTensor<float32>(contiguous.data<float32>().ToArray(), dims)
-
-    let toDenseInt64 (tensor: torch.Tensor) (dims: int array) =
-        use contiguous = tensor.contiguous()
-        DenseTensor<int64>(contiguous.data<int64>().ToArray(), dims)
-
 module TensorMath =
     let argmaxLast (logits: DenseTensor<float32>) =
-        let dims = logits.Dimensions.ToArray()
+        let dims = logits.Dimensions
         if dims.Length <> 3 then
             invalidArg (nameof logits) "Expected logits shape [batch, sequence, vocab]."
 
         let batch = dims[0]
         let sequence = dims[1]
-        use tensor = TorchTensor.fromDenseFloat logits
-        use last = tensor.select(1L, int64 (sequence - 1))
-        use ids = last.argmax(1L)
-        ids.data<int64>().ToArray()
+        let vocab = dims[2]
+        if batch < 1 || sequence < 1 || vocab < 1 then
+            invalidArg (nameof logits) "Expected logits shape [batch, sequence, vocab] with positive dimensions."
+
+        let values = logits.Buffer.Span
+        let strides = logits.Strides
+        let ids = Array.zeroCreate<int64> batch
+
+        for batchIndex in 0 .. batch - 1 do
+            let rowStart = (batchIndex * strides[0]) + ((sequence - 1) * strides[1])
+            let mutable bestIndex = 0
+            let mutable bestValue = values[rowStart]
+
+            for vocabIndex in 1 .. vocab - 1 do
+                let value = values[rowStart + (vocabIndex * strides[2])]
+                if value > bestValue then
+                    bestValue <- value
+                    bestIndex <- vocabIndex
+
+            ids[batchIndex] <- int64 bestIndex
+
+        ids
 
     let lastHidden (hiddenStates: DenseTensor<float32>) =
-        let dims = hiddenStates.Dimensions.ToArray()
+        let dims = hiddenStates.Dimensions
         if dims.Length <> 3 then
             invalidArg (nameof hiddenStates) "Expected hidden states shape [batch, sequence, hidden]."
 
         let batch = dims[0]
         let sequence = dims[1]
         let hidden = dims[2]
-        use tensor = TorchTensor.fromDenseFloat hiddenStates
-        use last = tensor.select(1L, int64 (sequence - 1))
-        TorchTensor.toDenseFloat last [| batch; hidden |]
+        if batch < 1 || sequence < 1 || hidden < 1 then
+            invalidArg (nameof hiddenStates) "Expected hidden states shape [batch, sequence, hidden] with positive dimensions."
+
+        let source = hiddenStates.Buffer.Span
+        let strides = hiddenStates.Strides
+        let values = Array.zeroCreate<float32> (batch * hidden)
+
+        for batchIndex in 0 .. batch - 1 do
+            let sourceStart = (batchIndex * strides[0]) + ((sequence - 1) * strides[1])
+            let destination = values.AsSpan(batchIndex * hidden, hidden)
+            if strides[2] = 1 then
+                source.Slice(sourceStart, hidden).CopyTo(destination)
+            else
+                for hiddenIndex in 0 .. hidden - 1 do
+                    destination[hiddenIndex] <- source[sourceStart + (hiddenIndex * strides[2])]
+
+        DenseTensor<float32>(values, [| batch; hidden |])
 
     let appendColumn (ids: DenseTensor<int64>) (nextIds: int64 array) =
-        let dims = ids.Dimensions.ToArray()
+        let dims = ids.Dimensions
         if dims.Length <> 2 then
             invalidArg (nameof ids) "Expected ids shape [batch, sequence]."
 
         let batch = dims[0]
         let sequence = dims[1]
+        if batch < 1 || sequence < 0 then
+            invalidArg (nameof ids) "Expected ids shape [batch, sequence] with non-empty batch and non-negative sequence."
+
         if nextIds.Length <> batch then
             invalidArg (nameof nextIds) "Expected one next id per batch row."
 
-        use current = TorchTensor.fromDenseInt64 ids
-        use next = torch.tensor(nextIds, dtype = Nullable(torch.int64)).reshape([| int64 batch; 1L |])
-        use appended = torch.cat([| current; next |], 1L)
-        TorchTensor.toDenseInt64 appended [| batch; sequence + 1 |]
+        let source = ids.Buffer.Span
+        let strides = ids.Strides
+        let nextSequence = sequence + 1
+        let values = Array.zeroCreate<int64> (batch * nextSequence)
+
+        for batchIndex in 0 .. batch - 1 do
+            let sourceStart = batchIndex * strides[0]
+            let destinationStart = batchIndex * nextSequence
+            if strides[1] = 1 then
+                source.Slice(sourceStart, sequence).CopyTo(values.AsSpan(destinationStart, sequence))
+            else
+                for sequenceIndex in 0 .. sequence - 1 do
+                    values[destinationStart + sequenceIndex] <- source[sourceStart + (sequenceIndex * strides[1])]
+            values[destinationStart + sequence] <- nextIds[batchIndex]
+
+        DenseTensor<int64>(values, [| batch; nextSequence |])
 
