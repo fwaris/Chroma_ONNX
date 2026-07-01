@@ -25,6 +25,8 @@ Memory note: `resident-merged` keeps the single merged ORT session loaded for lo
 
 ## Performance Comparison
 
+> The F#-ONNX version is 5X faster than Python-PyTorch on the GTX 3080 16GB and consumes much less OS memory. Why? [See this analysis](/performance_analysis/chroma_onnx_runtime_performance_analysis.md)
+
 The latest warm-generation benchmark compares persistent Python Chroma CUDA against persistent F#/ONNX CUDA on the same fixture. Model load, ONNX session creation, safetensor mapping, processor setup, and warmup requests are excluded. The benchmark is intended to represent a server process that is already loaded and receiving requests one after another.
 
 Benchmark fixture:
@@ -418,6 +420,8 @@ onnx/chroma-s2s-full-v2/
 ```
 
 With ORT 1.27, also build the local-external optimized ONNX cache shown in the previous section. It avoids ORT external-data path validation failures by placing hardlinks to the safetensor shards beside the cached ONNX metadata file.
+
+For a simplified visual overview of the merged dispatcher, split logical graphs, and original-vs-optimized ONNX shape, see [diagrams/onnx_s2s_simplified.md](diagrams/onnx_s2s_simplified.md).
 
 The manifest still describes the logical graph phases:
 
