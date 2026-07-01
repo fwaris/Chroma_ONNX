@@ -361,7 +361,7 @@ module Cli =
         let processor = ChromaNativeProcessor(modelDir, thinkerActiveFrames)
         let promptAudio = processor.ReadFloat32Pcm(promptAudioPath)
         let userAudio = processor.ReadFloat32Pcm(userAudioPath)
-        let prepared = processor.Prepare(promptText, systemPrompt, promptAudio, userAudio)
+        use prepared = processor.Prepare(promptText, systemPrompt, promptAudio, userAudio)
 
         File.WriteAllText(Path.Combine(outputDir, "conversation.txt"), prepared.ConversationText)
         File.Copy(promptAudioPath, Path.Combine(outputDir, "prompt_audio_24k.f32"), true)
@@ -459,7 +459,7 @@ module Cli =
         let processor = ChromaNativeProcessor(modelDir, thinkerActiveFrames)
         let promptAudio = processor.ReadFloat32Pcm(promptAudioPath)
         let userAudio = processor.ReadFloat32Pcm(userAudioPath)
-        let prepared = processor.Prepare(promptText, systemPrompt, promptAudio, userAudio)
+        use prepared = processor.Prepare(promptText, systemPrompt, promptAudio, userAudio)
 
         File.WriteAllText(Path.Combine(outputDir, "conversation.txt"), prepared.ConversationText)
         File.Copy(promptAudioPath, Path.Combine(outputDir, "prompt_audio_24k.f32"), true)
@@ -608,20 +608,22 @@ module Cli =
         let promptAudioSamples =
             if inputValuesShape.Length >= 3 then inputValuesShape[2] else 0
 
-        { InputIds = readI64 "input_ids"
-          AttentionMask = readI64 "attention_mask"
-          InputValues = inputValues
-          InputValuesCutoffs = readI64 "input_values_cutoffs"
-          ThinkerInputIds = readI64 "thinker_input_ids"
-          ThinkerAttentionMask = readI64 "thinker_attention_mask"
-          ThinkerInputFeatures = readF32 "thinker_input_features"
-          ThinkerFeatureAttentionMask = readI64 "thinker_feature_attention_mask"
-          PromptAudioSamples = promptAudioSamples
-          UserAudioSamples = 0
-          ConversationText = "" }
+        new NativeS2sPrepared(
+            readI64 "input_ids",
+            readI64 "attention_mask",
+            inputValues,
+            readI64 "input_values_cutoffs",
+            readI64 "thinker_input_ids",
+            readI64 "thinker_attention_mask",
+            readF32 "thinker_input_features",
+            readI64 "thinker_feature_attention_mask",
+            promptAudioSamples,
+            0,
+            ""
+        )
 
     let private writeS2sOnnxDebug modelDir bundleDir preparedDir outputDir executionProvider memoryMode tuningOptions frames =
-        let prepared = readPreparedTensors preparedDir
+        use prepared = readPreparedTensors preparedDir
 
         use runner = new ChromaS2sOnnxRunner(modelDir, bundleDir, executionProvider, memoryMode, tuningOptions)
         runner.WriteDebug(prepared, outputDir, frames)
@@ -785,7 +787,7 @@ module Cli =
         let processor = ChromaNativeProcessor(modelDir, thinkerActiveFrameCount)
         let promptAudio = processor.ReadFloat32Pcm(promptAudioPath)
         let userAudio = processor.ReadFloat32Pcm(userAudioPath)
-        let prepared = processor.Prepare(promptText, systemPrompt, promptAudio, userAudio)
+        use prepared = processor.Prepare(promptText, systemPrompt, promptAudio, userAudio)
         File.Copy(promptAudioPath, Path.Combine(fsharpDir, "prompt_audio_24k.f32"), true)
         File.Copy(userAudioPath, Path.Combine(fsharpDir, "user_audio_16k.f32"), true)
         File.WriteAllText(Path.Combine(fsharpDir, "conversation.txt"), prepared.ConversationText)
@@ -941,7 +943,7 @@ module Cli =
         let nativeProcessor = ChromaNativeProcessor(modelDir, thinkerActiveFrameCount)
         let nativePromptAudio = nativeProcessor.ReadFloat32Pcm(Path.Combine(rawInputDir, "prompt_audio_24k.f32"))
         let nativeUserAudio = nativeProcessor.ReadFloat32Pcm(Path.Combine(rawInputDir, "user_audio_16k.f32"))
-        let nativePrepared = nativeProcessor.Prepare(promptText, systemPrompt, nativePromptAudio, nativeUserAudio)
+        use nativePrepared = nativeProcessor.Prepare(promptText, systemPrompt, nativePromptAudio, nativeUserAudio)
         let nativePreparedDir = Path.Combine(outputDir, "fsharp_prepared")
         writePreparedDebug nativePreparedDir nativePrepared
         runCheckedProcess

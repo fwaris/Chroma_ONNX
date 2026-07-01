@@ -636,7 +636,7 @@ module S2sServe =
                                     let results = ResizeArray<JsonElement>()
                                     try
                                         if requestedBackends |> Array.contains "fsharp_onnx" then
-                                            let prepared = processor.Prepare(session.PromptText, session.SystemPrompt, session.PromptAudio24k, userAudio)
+                                            use prepared = processor.Prepare(session.PromptText, session.SystemPrompt, session.PromptAudio24k, userAudio)
                                             File.WriteAllText(Path.Combine(session.WorkDir, "conversation.txt"), prepared.ConversationText)
                                             results.Add(runFsharpBackend processor runner session userAudio prepared)
 

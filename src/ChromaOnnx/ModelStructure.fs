@@ -1,5 +1,7 @@
 namespace ChromaOnnx
 
+open System
+open System.Buffers
 open System.Collections.Generic
 open Microsoft.ML.OnnxRuntime.Tensors
 
@@ -24,18 +26,96 @@ type SystemPrefillResult =
       HiddenStates: DenseTensor<float32>
       BackboneAttentionMask: DenseTensor<float32> }
 
-type NativeS2sPrepared =
-    { InputIds: DenseTensor<int64>
-      AttentionMask: DenseTensor<int64>
-      InputValues: DenseTensor<float32>
-      InputValuesCutoffs: DenseTensor<int64>
-      ThinkerInputIds: DenseTensor<int64>
-      ThinkerAttentionMask: DenseTensor<int64>
-      ThinkerInputFeatures: DenseTensor<float32>
-      ThinkerFeatureAttentionMask: DenseTensor<int64>
-      PromptAudioSamples: int
-      UserAudioSamples: int
-      ConversationText: string }
+type RentedTensorBuffer<'T>(array: 'T array, count: int, clearOnReturn: bool) =
+    let mutable returned = false
+
+    member _.Memory = Memory<'T>(array, 0, count)
+
+    interface IDisposable with
+        member _.Dispose() =
+            if not returned then
+                returned <- true
+                ArrayPool<'T>.Shared.Return(array, clearArray = clearOnReturn)
+
+module RentedTensorBuffer =
+    let rent<'T> count clearOnReturn =
+        if count < 0 then
+            invalidArg (nameof count) "Buffer length cannot be negative."
+
+        new RentedTensorBuffer<'T>(ArrayPool<'T>.Shared.Rent(count), count, clearOnReturn)
+
+type NativeS2sPrepared
+    (
+        inputIds: DenseTensor<int64>,
+        attentionMask: DenseTensor<int64>,
+        inputValues: DenseTensor<float32>,
+        inputValuesCutoffs: DenseTensor<int64>,
+        thinkerInputIds: DenseTensor<int64>,
+        thinkerAttentionMask: DenseTensor<int64>,
+        thinkerInputFeatures: DenseTensor<float32>,
+        thinkerFeatureAttentionMask: DenseTensor<int64>,
+        promptAudioSamples: int,
+        userAudioSamples: int,
+        conversationText: string,
+        ?ownedBuffers: IDisposable array
+    ) =
+    let ownedBuffers = defaultArg ownedBuffers Array.empty
+    let mutable disposed = false
+
+    let ensureActive () =
+        if disposed then
+            invalidOp "NativeS2sPrepared has been disposed."
+
+    member _.InputIds =
+        ensureActive ()
+        inputIds
+
+    member _.AttentionMask =
+        ensureActive ()
+        attentionMask
+
+    member _.InputValues =
+        ensureActive ()
+        inputValues
+
+    member _.InputValuesCutoffs =
+        ensureActive ()
+        inputValuesCutoffs
+
+    member _.ThinkerInputIds =
+        ensureActive ()
+        thinkerInputIds
+
+    member _.ThinkerAttentionMask =
+        ensureActive ()
+        thinkerAttentionMask
+
+    member _.ThinkerInputFeatures =
+        ensureActive ()
+        thinkerInputFeatures
+
+    member _.ThinkerFeatureAttentionMask =
+        ensureActive ()
+        thinkerFeatureAttentionMask
+
+    member _.PromptAudioSamples =
+        ensureActive ()
+        promptAudioSamples
+
+    member _.UserAudioSamples =
+        ensureActive ()
+        userAudioSamples
+
+    member _.ConversationText =
+        ensureActive ()
+        conversationText
+
+    interface IDisposable with
+        member _.Dispose() =
+            if not disposed then
+                disposed <- true
+                for buffer in ownedBuffers do
+                    buffer.Dispose()
 
 type ChromaS2sBundleStatus =
     { Ready: bool

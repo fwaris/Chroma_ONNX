@@ -138,14 +138,38 @@ type ChromaNativeProcessor(modelDir: string, ?thinkerActiveFrames: int) =
 
         Array.init (bytes.Length / sizeof<float32>) (fun index -> BitConverter.ToSingle(bytes, index * sizeof<float32>))
 
-    let denseInt64Row (values: int64 array) =
-        DenseTensor<int64>(values, [| 1; values.Length |])
-
-    let denseOnes length =
-        DenseTensor<int64>(Array.create length 1L, [| 1; length |])
-
     let denseFloatAudio (values: float32 array) =
         DenseTensor<float32>(values, [| 1; 1; values.Length |])
+
+    let rentedInt64TensorFromValues (values: int64 array) (dimensions: int array) =
+        let buffer = RentedTensorBuffer.rent<int64> values.Length false
+        try
+            values.AsSpan().CopyTo(buffer.Memory.Span)
+            DenseTensor<int64>(buffer.Memory, ReadOnlySpan<int>(dimensions), false), buffer :> IDisposable
+        with
+        | _ ->
+            (buffer :> IDisposable).Dispose()
+            reraise()
+
+    let rentedInt64TensorFilled length (value: int64) (dimensions: int array) =
+        let buffer = RentedTensorBuffer.rent<int64> length false
+        try
+            buffer.Memory.Span.Fill(value)
+            DenseTensor<int64>(buffer.Memory, ReadOnlySpan<int>(dimensions), false), buffer :> IDisposable
+        with
+        | _ ->
+            (buffer :> IDisposable).Dispose()
+            reraise()
+
+    let rentedInt64TensorSingleton value =
+        let buffer = RentedTensorBuffer.rent<int64> 1 false
+        try
+            buffer.Memory.Span[0] <- value
+            DenseTensor<int64>(buffer.Memory, ReadOnlySpan<int>([| 1 |]), false), buffer :> IDisposable
+        with
+        | _ ->
+            (buffer :> IDisposable).Dispose()
+            reraise()
 
     let audioTokenOutputLength activeFrames =
         if activeFrames <= 0 then
@@ -183,57 +207,78 @@ type ChromaNativeProcessor(modelDir: string, ?thinkerActiveFrames: int) =
                 min thinkerMaxFrames (((sampleCount - 1) / thinkerHopLength) + 1)
 
         let activeFramesForExport = min activeFrames thinkerActiveFrameLimit
-        let featureValues = Array.zeroCreate<float32> (audioFeatureSize * thinkerMaxFrames)
+        let featureBuffer = RentedTensorBuffer.rent<float32> (audioFeatureSize * thinkerMaxFrames) true
+        let maskBuffer = RentedTensorBuffer.rent<int64> thinkerMaxFrames true
 
-        let mask =
-            Array.init thinkerMaxFrames (fun frameIndex -> if frameIndex < activeFramesForExport then 1L else 0L)
+        try
+            featureBuffer.Memory.Span.Clear()
 
-        if activeFramesForExport > 0 then
-            let framesToCompute = activeFrames
-            let samplesNeededForComputedFrames = min sampleCount (framesToCompute * thinkerHopLength)
-            let workingSampleCount = max 1 (min thinkerMaxSamples (samplesNeededForComputedFrames + thinkerNfft))
-            let workingPcm = Array.zeroCreate<float32> workingSampleCount
-            if sampleCount > 0 then
-                Array.Copy(pcm16k, workingPcm, min sampleCount workingSampleCount)
+            let mask = maskBuffer.Memory.Span
+            mask.Clear()
+            for frameIndex in 0 .. activeFramesForExport - 1 do
+                mask[frameIndex] <- 1L
 
-            use waveform = torch.tensor(workingPcm, dtype = Nullable(torch.float32))
-            use window = torch.hann_window(int64 thinkerNfft, dtype = Nullable(torch.float32))
-            use stft =
-                torch.stft(
-                    waveform,
-                    int64 thinkerNfft,
-                    hop_length = int64 thinkerHopLength,
-                    win_length = int64 thinkerNfft,
-                    window = window,
-                    center = true,
-                    normalized = false,
-                    onesided = true,
-                    return_complex = true
-                )
-            use magnitude = stft.abs()
-            use powerSpectrum = magnitude * magnitude
-            use melFilters =
-                torch
-                    .tensor(melFilterBank.Value, dtype = Nullable(torch.float32))
-                    .reshape([| int64 audioFeatureSize; int64 melFrequencyBins |])
-            use melSpectrum = torch.matmul(melFilters, powerSpectrum).clamp_min(1e-10).log10()
-            use trimmed = melSpectrum.narrow(1L, 0L, int64 framesToCompute)
-            use floor = torch.maximum(trimmed, trimmed.max() - 8.0)
-            use normalized = (floor + 4.0) / 4.0
-            let activeFeatureValues = normalized.contiguous().data<float32>().ToArray()
+            if activeFramesForExport > 0 then
+                let framesToCompute = activeFrames
+                let samplesNeededForComputedFrames = min sampleCount (framesToCompute * thinkerHopLength)
+                let workingSampleCount = max 1 (min thinkerMaxSamples (samplesNeededForComputedFrames + thinkerNfft))
+                use workingBuffer = RentedTensorBuffer.rent<float32> workingSampleCount true
+                let workingPcm = workingBuffer.Memory.Span
+                workingPcm.Clear()
+                if sampleCount > 0 then
+                    pcm16k
+                        .AsSpan(0, min sampleCount workingSampleCount)
+                        .CopyTo(workingPcm)
 
-            for featureIndex in 0 .. audioFeatureSize - 1 do
-                Array.Copy(
-                    activeFeatureValues,
-                    featureIndex * framesToCompute,
-                    featureValues,
-                    featureIndex * thinkerMaxFrames,
-                    activeFramesForExport
-                )
+                use waveform =
+                    torch.tensor(
+                        workingBuffer.Memory,
+                        ReadOnlySpan<int64>([| int64 workingSampleCount |]),
+                        dtype = Nullable(torch.float32)
+                    )
+                use window = torch.hann_window(int64 thinkerNfft, dtype = Nullable(torch.float32))
+                use stft =
+                    torch.stft(
+                        waveform,
+                        int64 thinkerNfft,
+                        hop_length = int64 thinkerHopLength,
+                        win_length = int64 thinkerNfft,
+                        window = window,
+                        center = true,
+                        normalized = false,
+                        onesided = true,
+                        return_complex = true
+                    )
+                use magnitude = stft.abs()
+                use powerSpectrum = magnitude * magnitude
+                use melFilters =
+                    torch
+                        .tensor(melFilterBank.Value, dtype = Nullable(torch.float32))
+                        .reshape([| int64 audioFeatureSize; int64 melFrequencyBins |])
+                use melSpectrum = torch.matmul(melFilters, powerSpectrum).clamp_min(1e-10).log10()
+                use trimmed = melSpectrum.narrow(1L, 0L, int64 framesToCompute)
+                use floor = torch.maximum(trimmed, trimmed.max() - 8.0)
+                use normalized = (floor + 4.0) / 4.0
+                use contiguous = normalized.contiguous()
+                let activeFeatureValues = contiguous.data<float32>()
+                let featureValues = featureBuffer.Memory.Span
 
-        DenseTensor<float32>(featureValues, [| 1; audioFeatureSize; thinkerMaxFrames |]),
-        DenseTensor<int64>(mask, [| 1; thinkerMaxFrames |]),
-        audioTokenOutputLength activeFramesForExport
+                for featureIndex in 0 .. audioFeatureSize - 1 do
+                    activeFeatureValues.CopyTo(
+                        featureValues.Slice(featureIndex * thinkerMaxFrames, activeFramesForExport),
+                        0,
+                        int64 (featureIndex * framesToCompute)
+                    )
+
+            DenseTensor<float32>(featureBuffer.Memory, ReadOnlySpan<int>([| 1; audioFeatureSize; thinkerMaxFrames |]), false),
+            DenseTensor<int64>(maskBuffer.Memory, ReadOnlySpan<int>([| 1; thinkerMaxFrames |]), false),
+            audioTokenOutputLength activeFramesForExport,
+            [| featureBuffer :> IDisposable; maskBuffer :> IDisposable |]
+        with
+        | _ ->
+            (featureBuffer :> IDisposable).Dispose()
+            (maskBuffer :> IDisposable).Dispose()
+            reraise()
 
     member _.PromptSampleRate = promptSampleRate
     member _.ThinkerSampleRate = thinkerSampleRate
@@ -260,19 +305,41 @@ type ChromaNativeProcessor(modelDir: string, ?thinkerActiveFrames: int) =
             invalidArg (nameof userAudio16k) "User turn PCM must contain at least one sample."
 
         let promptIds = encode promptText
-        let thinkerFeatures, thinkerFeatureMask, audioTokenCount = extractThinkerFeatures userAudio16k
-        let conversationText = renderConversation systemPrompt audioTokenCount
-        let thinkerIds = encode conversationText
+        let thinkerFeatures, thinkerFeatureMask, audioTokenCount, ownedBuffers = extractThinkerFeatures userAudio16k
+        let owned = ResizeArray<IDisposable>(ownedBuffers)
 
-        { InputIds = denseInt64Row promptIds
-          AttentionMask = denseOnes promptIds.Length
-          InputValues = denseFloatAudio promptAudio24k
-          InputValuesCutoffs = DenseTensor<int64>([| int64 promptAudio24k.Length |], [| 1 |])
-          ThinkerInputIds = denseInt64Row thinkerIds
-          ThinkerAttentionMask = denseOnes thinkerIds.Length
-          ThinkerInputFeatures = thinkerFeatures
-          ThinkerFeatureAttentionMask = thinkerFeatureMask
-          PromptAudioSamples = promptAudio24k.Length
-          UserAudioSamples = userAudio16k.Length
-          ConversationText = conversationText }
+        try
+            let conversationText = renderConversation systemPrompt audioTokenCount
+            let thinkerIds = encode conversationText
+
+            let inputIds, inputIdsBuffer = rentedInt64TensorFromValues promptIds [| 1; promptIds.Length |]
+            owned.Add(inputIdsBuffer)
+            let attentionMask, attentionMaskBuffer = rentedInt64TensorFilled promptIds.Length 1L [| 1; promptIds.Length |]
+            owned.Add(attentionMaskBuffer)
+            let inputValuesCutoffs, inputValuesCutoffsBuffer = rentedInt64TensorSingleton (int64 promptAudio24k.Length)
+            owned.Add(inputValuesCutoffsBuffer)
+            let thinkerInputIds, thinkerInputIdsBuffer = rentedInt64TensorFromValues thinkerIds [| 1; thinkerIds.Length |]
+            owned.Add(thinkerInputIdsBuffer)
+            let thinkerAttentionMask, thinkerAttentionMaskBuffer = rentedInt64TensorFilled thinkerIds.Length 1L [| 1; thinkerIds.Length |]
+            owned.Add(thinkerAttentionMaskBuffer)
+
+            new NativeS2sPrepared(
+                inputIds,
+                attentionMask,
+                denseFloatAudio promptAudio24k,
+                inputValuesCutoffs,
+                thinkerInputIds,
+                thinkerAttentionMask,
+                thinkerFeatures,
+                thinkerFeatureMask,
+                promptAudio24k.Length,
+                userAudio16k.Length,
+                conversationText,
+                owned.ToArray()
+            )
+        with
+        | _ ->
+            for buffer in owned do
+                buffer.Dispose()
+            reraise()
 
