@@ -10,6 +10,19 @@ open System.Text.Json
 open Microsoft.ML.OnnxRuntime
 open Microsoft.ML.OnnxRuntime.Tensors
 
+type private OwnedDecoderOutput(logits: DenseTensor<float32>, cache: Dictionary<string, DenseTensor<float32>>, owners: IDisposable array) =
+    let mutable disposed = false
+
+    member _.Logits = logits
+    member _.Cache = cache
+
+    interface IDisposable with
+        member _.Dispose() =
+            if not disposed then
+                disposed <- true
+                for owner in owners do
+                    owner.Dispose()
+
 type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider: string, memoryMode: string, tuningOptions: S2sOrtTuningOptions) =
     let manifestPath = Path.Combine(bundleDir, "shared_weights_manifest.json")
     let mergedGraphName = "s2s_merged"
@@ -374,12 +387,26 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         |> fun value -> value.AsTensor<float32>()
         |> TensorIO.cloneFloatTensor
 
+    let cloneFloatByNameOwned graphName (results: IDisposableReadOnlyCollection<DisposableNamedOnnxValue>) name =
+        let expectedName = qualifiedName graphName name
+        results
+        |> Seq.find (fun value -> value.Name = expectedName)
+        |> fun value -> value.AsTensor<float32>()
+        |> TensorIO.cloneFloatTensorOwned
+
     let cloneInt64ByName graphName (results: IDisposableReadOnlyCollection<DisposableNamedOnnxValue>) name =
         let expectedName = qualifiedName graphName name
         results
         |> Seq.find (fun value -> value.Name = expectedName)
         |> fun value -> value.AsTensor<int64>()
         |> TensorIO.cloneInt64Tensor
+
+    let cloneInt64ByNameOwned graphName (results: IDisposableReadOnlyCollection<DisposableNamedOnnxValue>) name =
+        let expectedName = qualifiedName graphName name
+        results
+        |> Seq.find (fun value -> value.Name = expectedName)
+        |> fun value -> value.AsTensor<int64>()
+        |> TensorIO.cloneInt64TensorOwned
 
     let collectFloatOutputs graphName (results: IDisposableReadOnlyCollection<DisposableNamedOnnxValue>) prefix =
         let values = Dictionary<string, DenseTensor<float32>>(StringComparer.Ordinal)
@@ -388,6 +415,31 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
             if name.StartsWith(prefix, StringComparison.Ordinal) then
                 values[name] <- result.AsTensor<float32>() |> TensorIO.cloneFloatTensor
         values
+
+    let collectFloatOutputsOwned graphName (results: IDisposableReadOnlyCollection<DisposableNamedOnnxValue>) prefix =
+        let values = Dictionary<string, DenseTensor<float32>>(StringComparer.Ordinal)
+        let owners = ResizeArray<IDisposable>()
+        try
+            for result in results do
+                let name = originalName graphName result.Name
+                if name.StartsWith(prefix, StringComparison.Ordinal) then
+                    let tensor, owner = result.AsTensor<float32>() |> TensorIO.cloneFloatTensorOwned
+                    values[name] <- tensor
+                    owners.Add(owner)
+            values, owners.ToArray()
+        with
+        | _ ->
+            for owner in owners do
+                owner.Dispose()
+            reraise()
+
+    let addOwnedTensor (owners: ResizeArray<IDisposable>) (tensor, owner: IDisposable) =
+        owners.Add(owner)
+        tensor
+
+    let disposeOwners (owners: ResizeArray<IDisposable>) =
+        for owner in owners do
+            owner.Dispose()
 
     let addBackboneCacheInputs graphName (inputs: List<NamedOnnxValue>) (cache: Dictionary<string, DenseTensor<float32>>) =
         for name in graphInputNames graphName do
@@ -446,56 +498,94 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         |> Option.map (fun tensor -> tensor.Dimensions[2])
         |> Option.defaultWith (fun () -> invalidOp "Decoder cache is empty.")
 
-    let decoderAttentionMask (batch: int) (sequenceLength: int) =
-        DenseTensor<int64>(Array.create (batch * sequenceLength) 1L, [| batch; sequenceLength |])
+    let rentedDecoderAttentionMask (batch: int) (sequenceLength: int) =
+        let buffer = RentedTensorBuffer.rent<int64> (batch * sequenceLength) false
+        try
+            buffer.Memory.Span.Fill(1L)
+            DenseTensor<int64>(buffer.Memory, ReadOnlySpan<int>([| batch; sequenceLength |]), false), buffer :> IDisposable
+        with
+        | _ ->
+            (buffer :> IDisposable).Dispose()
+            reraise()
 
-    let decoderCachePosition (start: int) (length: int) =
-        DenseTensor<int64>(Array.init length (fun index -> int64 (start + index)), [| length |])
+    let rentedDecoderCachePosition (start: int) (length: int) =
+        let buffer = RentedTensorBuffer.rent<int64> length false
+        try
+            let values = buffer.Memory.Span
+            for index in 0 .. length - 1 do
+                values[index] <- int64 (start + index)
+            DenseTensor<int64>(buffer.Memory, ReadOnlySpan<int>([| length |]), false), buffer :> IDisposable
+        with
+        | _ ->
+            (buffer :> IDisposable).Dispose()
+            reraise()
 
     let runDecoderPrefill (inputIds: DenseTensor<int64>) (backboneLastHiddenState: DenseTensor<float32>) =
         let graphName = "decoder_prefill"
         let batch = inputIds.Dimensions[0]
         let sequenceLength = inputIds.Dimensions[1]
-        let attentionMask = decoderAttentionMask batch (sequenceLength + 1)
-        let cachePosition = decoderCachePosition 0 sequenceLength
+        let attentionMask, attentionMaskBuffer = rentedDecoderAttentionMask batch (sequenceLength + 1)
+        use _attentionMaskOwner = attentionMaskBuffer
+        let cachePosition, cachePositionBuffer = rentedDecoderCachePosition 0 sequenceLength
+        use _cachePositionOwner = cachePositionBuffer
         let inputs = List<NamedOnnxValue>()
         inputs.Add(createInput graphName "input_ids" inputIds)
         inputs.Add(createInput graphName "backbone_last_hidden_state" backboneLastHiddenState)
         inputs.Add(createInput graphName "attention_mask" attentionMask)
         inputs.Add(createInput graphName "cache_position" cachePosition)
         runGraph graphName inputs (fun results ->
-            cloneFloatByName graphName results "logits", collectFloatOutputs graphName results "decoder_present_")
+            let logits, logitsOwner = cloneFloatByNameOwned graphName results "logits"
+            try
+                let cache, cacheOwners = collectFloatOutputsOwned graphName results "decoder_present_"
+                new OwnedDecoderOutput(logits, cache, Array.append [| logitsOwner |] cacheOwners)
+            with
+            | _ ->
+                logitsOwner.Dispose()
+                reraise())
 
     let runDecoderStep (inputIds: DenseTensor<int64>) (cache: Dictionary<string, DenseTensor<float32>>) =
         let graphName = "decoder_step"
         let batch = inputIds.Dimensions[0]
         let sequenceLength = inputIds.Dimensions[1]
         let pastSequenceLength = decoderCacheSequenceLength cache
-        let attentionMask = decoderAttentionMask batch (pastSequenceLength + sequenceLength)
-        let cachePosition = decoderCachePosition (pastSequenceLength - sequenceLength) sequenceLength
+        let attentionMask, attentionMaskBuffer = rentedDecoderAttentionMask batch (pastSequenceLength + sequenceLength)
+        use _attentionMaskOwner = attentionMaskBuffer
+        let cachePosition, cachePositionBuffer = rentedDecoderCachePosition (pastSequenceLength - sequenceLength) sequenceLength
+        use _cachePositionOwner = cachePositionBuffer
         let inputs = List<NamedOnnxValue>()
         inputs.Add(createInput graphName "input_ids" inputIds)
         inputs.Add(createInput graphName "attention_mask" attentionMask)
         inputs.Add(createInput graphName "cache_position" cachePosition)
         addDecoderCacheInputs graphName inputs cache
         runGraph graphName inputs (fun results ->
-            cloneFloatByName graphName results "logits", collectFloatOutputs graphName results "decoder_present_")
+            let logits, logitsOwner = cloneFloatByNameOwned graphName results "logits"
+            try
+                let nextCache, cacheOwners = collectFloatOutputsOwned graphName results "decoder_present_"
+                new OwnedDecoderOutput(logits, nextCache, Array.append [| logitsOwner |] cacheOwners)
+            with
+            | _ ->
+                logitsOwner.Dispose()
+                reraise())
 
     let greedyAudioFrame (logits: DenseTensor<float32>) (hiddenStates: DenseTensor<float32>) =
         let firstIds = TensorMath.argmaxLast logits
         let hidden = TensorMath.lastHidden hiddenStates
         let mutable ids = DenseTensor<int64>(firstIds, [| firstIds.Length; 1 |])
-        let mutable decoderLogits, decoderCache = runDecoderPrefill ids hidden
-        let mutable nextIds = TensorMath.argmaxLast decoderLogits
-        ids <- TensorMath.appendColumn ids nextIds
-
-        for _ in 3 .. audioNumCodebooks do
-            let stepInput = DenseTensor<int64>(nextIds, [| nextIds.Length; 1 |])
-            let stepLogits, stepCache = runDecoderStep stepInput decoderCache
-            decoderLogits <- stepLogits
-            decoderCache <- stepCache
-            nextIds <- TensorMath.argmaxLast decoderLogits
+        let mutable decoderOutput = runDecoderPrefill ids hidden
+        try
+            let mutable nextIds = TensorMath.argmaxLast decoderOutput.Logits
             ids <- TensorMath.appendColumn ids nextIds
+
+            for _ in 3 .. audioNumCodebooks do
+                let stepInput = DenseTensor<int64>(nextIds, [| nextIds.Length; 1 |])
+                let nextDecoderOutput = runDecoderStep stepInput decoderOutput.Cache
+                let previousDecoderOutput = decoderOutput
+                decoderOutput <- nextDecoderOutput
+                (previousDecoderOutput :> IDisposable).Dispose()
+                nextIds <- TensorMath.argmaxLast decoderOutput.Logits
+                ids <- TensorMath.appendColumn ids nextIds
+        finally
+            (decoderOutput :> IDisposable).Dispose()
 
         ids
 
@@ -592,7 +682,7 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         let graphName = "codec_decode"
         let inputs = List<NamedOnnxValue>()
         inputs.Add(createInput graphName "audio_codes" audioCodes)
-        runGraph graphName inputs (fun results -> cloneFloatByName graphName results "audio_values")
+        runGraph graphName inputs (fun results -> cloneFloatByNameOwned graphName results "audio_values")
 
     let runGeneratePrefill (prepared: NativeS2sPrepared) =
         let graphName = "generate_prefill"
@@ -606,32 +696,84 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         inputs.Add(createInput graphName "thinker_input_features" prepared.ThinkerInputFeatures)
         inputs.Add(createInput graphName "thinker_feature_attention_mask" prepared.ThinkerFeatureAttentionMask)
         runGraph graphName inputs (fun results ->
+            let stepOwners = ResizeArray<IDisposable>()
+            let backboneOwners = ResizeArray<IDisposable>()
+            let thinkerOwners = ResizeArray<IDisposable>()
+            try
+                let logits = cloneFloatByNameOwned graphName results "logits" |> addOwnedTensor stepOwners
+                let hiddenStates = cloneFloatByNameOwned graphName results "hidden_states" |> addOwnedTensor stepOwners
+                let attentionMask = cloneFloatByNameOwned graphName results "next_attention_mask" |> addOwnedTensor backboneOwners
+                let thinkerInputIds = cloneInt64ByNameOwned graphName results "next_thinker_input_ids" |> addOwnedTensor thinkerOwners
+                let thinkerAttentionMask = cloneInt64ByNameOwned graphName results "next_thinker_attention_mask" |> addOwnedTensor thinkerOwners
+                let thinkerCachePosition = cloneInt64ByNameOwned graphName results "next_thinker_cache_position" |> addOwnedTensor thinkerOwners
+                let thinkerEos = cloneInt64ByNameOwned graphName results "next_thinker_eos" |> addOwnedTensor thinkerOwners
+                let backboneCache, backboneCacheOwners = collectFloatOutputsOwned graphName results "backbone_present_"
+                let thinkerCache, thinkerCacheOwners = collectFloatOutputsOwned graphName results "thinker_present_"
+                backboneOwners.AddRange(backboneCacheOwners)
+                thinkerOwners.AddRange(thinkerCacheOwners)
+                { Logits = logits
+                  HiddenStates = hiddenStates
+                  State =
+                    { AttentionMask = attentionMask
+                      ThinkerInputIds = thinkerInputIds
+                      ThinkerAttentionMask = thinkerAttentionMask
+                      ThinkerCachePosition = thinkerCachePosition
+                      ThinkerEos = thinkerEos
+                      BackboneCache = backboneCache
+                      ThinkerCache = thinkerCache
+                      BackboneOwnedBuffers = OwnedBufferGroup.ofArray (backboneOwners.ToArray())
+                      ThinkerOwnedBuffers = OwnedBufferGroup.ofArray (thinkerOwners.ToArray()) }
+                  OwnedBuffers = stepOwners.ToArray() }
+            with
+            | _ ->
+                disposeOwners stepOwners
+                disposeOwners backboneOwners
+                disposeOwners thinkerOwners
+                reraise())
 
-            { Logits = cloneFloatByName graphName results "logits"
-              HiddenStates = cloneFloatByName graphName results "hidden_states"
-              State =
-                { AttentionMask = cloneFloatByName graphName results "next_attention_mask"
-                  ThinkerInputIds = cloneInt64ByName graphName results "next_thinker_input_ids"
-                  ThinkerAttentionMask = cloneInt64ByName graphName results "next_thinker_attention_mask"
-                  ThinkerCachePosition = cloneInt64ByName graphName results "next_thinker_cache_position"
-                  ThinkerEos = cloneInt64ByName graphName results "next_thinker_eos"
-                  BackboneCache = collectFloatOutputs graphName results "backbone_present_"
-                  ThinkerCache = collectFloatOutputs graphName results "thinker_present_" } })
-
-    let runBackboneFrameStep (frameCodes: DenseTensor<int64>) (state: S2sGraphState) =
+    let runBackboneFrameStep transferThinkerOwnership (frameCodes: DenseTensor<int64>) (state: S2sGraphState) =
         let graphName = "backbone_frame_step"
         let inputs = List<NamedOnnxValue>()
         inputs.Add(createInput graphName "frame_codes" frameCodes)
         inputs.Add(createInput graphName "attention_mask" state.AttentionMask)
         addBackboneCacheInputs graphName inputs state.BackboneCache
         runGraph graphName inputs (fun results ->
-
-            { Logits = cloneFloatByName graphName results "logits"
-              HiddenStates = cloneFloatByName graphName results "hidden_states"
-              State =
-                { state with
-                    AttentionMask = cloneFloatByName graphName results "next_attention_mask"
-                    BackboneCache = collectFloatOutputs graphName results "backbone_present_" } })
+            let stepOwners = ResizeArray<IDisposable>()
+            let backboneOwners = ResizeArray<IDisposable>()
+            let mutable transferredThinkerOwners: OwnedBufferGroup option = None
+            try
+                let logits = cloneFloatByNameOwned graphName results "logits" |> addOwnedTensor stepOwners
+                let hiddenStates = cloneFloatByNameOwned graphName results "hidden_states" |> addOwnedTensor stepOwners
+                let attentionMask = cloneFloatByNameOwned graphName results "next_attention_mask" |> addOwnedTensor backboneOwners
+                let backboneCache, backboneCacheOwners = collectFloatOutputsOwned graphName results "backbone_present_"
+                backboneOwners.AddRange(backboneCacheOwners)
+                let thinkerOwnedBuffers =
+                    if transferThinkerOwnership then
+                        let transferred = state.ThinkerOwnedBuffers.Transfer()
+                        transferredThinkerOwners <- Some transferred
+                        transferred
+                    else
+                        OwnedBufferGroup.empty ()
+                { Logits = logits
+                  HiddenStates = hiddenStates
+                  State =
+                    { AttentionMask = attentionMask
+                      ThinkerInputIds = state.ThinkerInputIds
+                      ThinkerAttentionMask = state.ThinkerAttentionMask
+                      ThinkerCachePosition = state.ThinkerCachePosition
+                      ThinkerEos = state.ThinkerEos
+                      BackboneCache = backboneCache
+                      ThinkerCache = state.ThinkerCache
+                      BackboneOwnedBuffers = OwnedBufferGroup.ofArray (backboneOwners.ToArray())
+                      ThinkerOwnedBuffers = thinkerOwnedBuffers }
+                  OwnedBuffers = stepOwners.ToArray() }
+            with
+            | _ ->
+                disposeOwners stepOwners
+                disposeOwners backboneOwners
+                transferredThinkerOwners
+                |> Option.iter (fun owners -> (owners :> IDisposable).Dispose())
+                reraise())
 
     let runBackboneThinkerStep (frameCodes: DenseTensor<int64>) (state: S2sGraphState) =
         let graphName = "backbone_thinker_step"
@@ -645,17 +787,40 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         addBackboneCacheInputs graphName inputs state.BackboneCache
         addThinkerCacheInputs graphName inputs state.ThinkerCache
         runGraph graphName inputs (fun results ->
-
-            { Logits = cloneFloatByName graphName results "logits"
-              HiddenStates = cloneFloatByName graphName results "hidden_states"
-              State =
-                { AttentionMask = cloneFloatByName graphName results "next_attention_mask"
-                  ThinkerInputIds = cloneInt64ByName graphName results "next_thinker_input_ids"
-                  ThinkerAttentionMask = cloneInt64ByName graphName results "next_thinker_attention_mask"
-                  ThinkerCachePosition = cloneInt64ByName graphName results "next_thinker_cache_position"
-                  ThinkerEos = cloneInt64ByName graphName results "next_thinker_eos"
-                  BackboneCache = collectFloatOutputs graphName results "backbone_present_"
-                  ThinkerCache = collectFloatOutputs graphName results "thinker_present_" } })
+            let stepOwners = ResizeArray<IDisposable>()
+            let backboneOwners = ResizeArray<IDisposable>()
+            let thinkerOwners = ResizeArray<IDisposable>()
+            try
+                let logits = cloneFloatByNameOwned graphName results "logits" |> addOwnedTensor stepOwners
+                let hiddenStates = cloneFloatByNameOwned graphName results "hidden_states" |> addOwnedTensor stepOwners
+                let attentionMask = cloneFloatByNameOwned graphName results "next_attention_mask" |> addOwnedTensor backboneOwners
+                let thinkerInputIds = cloneInt64ByNameOwned graphName results "next_thinker_input_ids" |> addOwnedTensor thinkerOwners
+                let thinkerAttentionMask = cloneInt64ByNameOwned graphName results "next_thinker_attention_mask" |> addOwnedTensor thinkerOwners
+                let thinkerCachePosition = cloneInt64ByNameOwned graphName results "next_thinker_cache_position" |> addOwnedTensor thinkerOwners
+                let thinkerEos = cloneInt64ByNameOwned graphName results "next_thinker_eos" |> addOwnedTensor thinkerOwners
+                let backboneCache, backboneCacheOwners = collectFloatOutputsOwned graphName results "backbone_present_"
+                let thinkerCache, thinkerCacheOwners = collectFloatOutputsOwned graphName results "thinker_present_"
+                backboneOwners.AddRange(backboneCacheOwners)
+                thinkerOwners.AddRange(thinkerCacheOwners)
+                { Logits = logits
+                  HiddenStates = hiddenStates
+                  State =
+                    { AttentionMask = attentionMask
+                      ThinkerInputIds = thinkerInputIds
+                      ThinkerAttentionMask = thinkerAttentionMask
+                      ThinkerCachePosition = thinkerCachePosition
+                      ThinkerEos = thinkerEos
+                      BackboneCache = backboneCache
+                      ThinkerCache = thinkerCache
+                      BackboneOwnedBuffers = OwnedBufferGroup.ofArray (backboneOwners.ToArray())
+                      ThinkerOwnedBuffers = OwnedBufferGroup.ofArray (thinkerOwners.ToArray()) }
+                  OwnedBuffers = stepOwners.ToArray() }
+            with
+            | _ ->
+                disposeOwners stepOwners
+                disposeOwners backboneOwners
+                disposeOwners thinkerOwners
+                reraise())
 
     let debugJsonOptions =
         JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, WriteIndented = true)
@@ -764,6 +929,12 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         let maxDebugFrames = defaultArg maxFrames 8
 
         let prefill = runGeneratePrefill prepared
+        let mutable traceState = prefill.State
+        use _prefillOwner = prefill :> IDisposable
+        use _traceStateOwner =
+            { new IDisposable with
+                member _.Dispose() = (traceState :> IDisposable).Dispose() }
+
         writeDebugFloat outputDir infos "prefill_logits" prefill.Logits
         writeDebugFloat outputDir infos "prefill_hidden_states" prefill.HiddenStates
         writeDebugFloat outputDir infos "prefill_next_attention_mask" prefill.State.AttentionMask
@@ -780,37 +951,44 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
 
         let mutable ids = DenseTensor<int64>(firstIds, [| firstIds.Length; 1 |])
         writeDebugInt64 outputDir infos "decoder_cache_step_1_input_ids" ids
-        let prefillDecoderLogits, prefillDecoderCache = runDecoderPrefill ids hidden
-        writeDebugFloat outputDir infos "decoder_cache_step_1_logits" prefillDecoderLogits
-        let mutable nextIds = TensorMath.argmaxLast prefillDecoderLogits
-        writeDebugInt64Array outputDir infos "decoder_cache_step_1_next_ids" nextIds [| nextIds.Length; 1 |]
-        ids <- TensorMath.appendColumn ids nextIds
-        let mutable decoderCache = prefillDecoderCache
-
-        for stepIndex in 2 .. audioNumCodebooks - 1 do
-            let stepInput = DenseTensor<int64>(nextIds, [| nextIds.Length; 1 |])
-            writeDebugInt64 outputDir infos $"decoder_cache_step_{stepIndex}_input_ids" stepInput
-            let decoderLogits, nextCache = runDecoderStep stepInput decoderCache
-            writeDebugFloat outputDir infos $"decoder_cache_step_{stepIndex}_logits" decoderLogits
-            nextIds <- TensorMath.argmaxLast decoderLogits
-            writeDebugInt64Array outputDir infos $"decoder_cache_step_{stepIndex}_next_ids" nextIds [| nextIds.Length; 1 |]
+        let mutable decoderOutput = runDecoderPrefill ids hidden
+        try
+            writeDebugFloat outputDir infos "decoder_cache_step_1_logits" decoderOutput.Logits
+            let mutable nextIds = TensorMath.argmaxLast decoderOutput.Logits
+            writeDebugInt64Array outputDir infos "decoder_cache_step_1_next_ids" nextIds [| nextIds.Length; 1 |]
             ids <- TensorMath.appendColumn ids nextIds
-            decoderCache <- nextCache
+
+            for stepIndex in 2 .. audioNumCodebooks - 1 do
+                let stepInput = DenseTensor<int64>(nextIds, [| nextIds.Length; 1 |])
+                writeDebugInt64 outputDir infos $"decoder_cache_step_{stepIndex}_input_ids" stepInput
+                let nextDecoderOutput = runDecoderStep stepInput decoderOutput.Cache
+                let previousDecoderOutput = decoderOutput
+                decoderOutput <- nextDecoderOutput
+                (previousDecoderOutput :> IDisposable).Dispose()
+                writeDebugFloat outputDir infos $"decoder_cache_step_{stepIndex}_logits" decoderOutput.Logits
+                nextIds <- TensorMath.argmaxLast decoderOutput.Logits
+                writeDebugInt64Array outputDir infos $"decoder_cache_step_{stepIndex}_next_ids" nextIds [| nextIds.Length; 1 |]
+                ids <- TensorMath.appendColumn ids nextIds
+        finally
+            (decoderOutput :> IDisposable).Dispose()
 
         writeDebugInt64 outputDir infos "decoder_cache_frame_ids" ids
         writeDebugInt64 outputDir infos "decoder_generate_frame_ids" ids
         writeDebugInt64 outputDir infos "decoder_loop_frame_ids" ids
 
         let frameInput = frameToInputIds ids
-        let frameStep = runBackboneFrameStep frameInput prefill.State
-        writeDebugInt64 outputDir infos "backbone_frame_step_input_ids" frameInput
-        writeDebugFloat outputDir infos "backbone_frame_step_logits" frameStep.Logits
-        writeDebugFloat outputDir infos "backbone_frame_step_hidden_states" frameStep.HiddenStates
-        let nextCodebook0 = TensorMath.argmaxLast frameStep.Logits
-        writeDebugInt64Array outputDir infos "backbone_frame_step_codebook0_ids" nextCodebook0 [| nextCodebook0.Length; 1 |]
+        let frameStep = runBackboneFrameStep false frameInput prefill.State
+        try
+            writeDebugInt64 outputDir infos "backbone_frame_step_input_ids" frameInput
+            writeDebugFloat outputDir infos "backbone_frame_step_logits" frameStep.Logits
+            writeDebugFloat outputDir infos "backbone_frame_step_hidden_states" frameStep.HiddenStates
+            let nextCodebook0 = TensorMath.argmaxLast frameStep.Logits
+            writeDebugInt64Array outputDir infos "backbone_frame_step_codebook0_ids" nextCodebook0 [| nextCodebook0.Length; 1 |]
+        finally
+            (frameStep.State :> IDisposable).Dispose()
+            (frameStep :> IDisposable).Dispose()
 
         let mutable traceCurrent = ids
-        let mutable traceState = prefill.State
         let mutable traceInput = frameToInputIds traceCurrent
         let mutable traceUseThinker = false
         writeDebugInt64 outputDir infos "trace_frame_0_ids" traceCurrent
@@ -830,20 +1008,25 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
                     "thinker", runBackboneThinkerStep traceInput traceState
                 else
                     traceUseThinker <- thinkerActive
-                    "frame", runBackboneFrameStep traceInput traceState
+                    "frame", runBackboneFrameStep true traceInput traceState
 
-            writeDebugInt64Array outputDir infos $"trace_step_{frameIndex}_kind" [| if stepKind = "thinker" then 1L else 0L |] [| 1 |]
-            writeDebugFloat outputDir infos $"trace_step_{frameIndex}_logits" traceStep.Logits
-            writeDebugFloat outputDir infos $"trace_step_{frameIndex}_hidden_states" traceStep.HiddenStates
+            let previousTraceState = traceState
             traceState <- traceStep.State
-            traceCurrent <- greedyAudioFrame traceStep.Logits traceStep.HiddenStates
-            traceInput <- frameToInputIds traceCurrent
-            writeDebugInt64 outputDir infos $"trace_frame_{frameIndex}_ids" traceCurrent
-            writeDebugFloat outputDir infos $"trace_state_{frameIndex}_attention_mask" traceState.AttentionMask
-            writeDebugInt64 outputDir infos $"trace_state_{frameIndex}_thinker_input_ids" traceState.ThinkerInputIds
-            writeDebugInt64 outputDir infos $"trace_state_{frameIndex}_thinker_attention_mask" traceState.ThinkerAttentionMask
-            writeDebugInt64 outputDir infos $"trace_state_{frameIndex}_thinker_cache_position" traceState.ThinkerCachePosition
-            writeDebugInt64 outputDir infos $"trace_state_{frameIndex}_thinker_eos" traceState.ThinkerEos
+            (previousTraceState :> IDisposable).Dispose()
+            try
+                writeDebugInt64Array outputDir infos $"trace_step_{frameIndex}_kind" [| if stepKind = "thinker" then 1L else 0L |] [| 1 |]
+                writeDebugFloat outputDir infos $"trace_step_{frameIndex}_logits" traceStep.Logits
+                writeDebugFloat outputDir infos $"trace_step_{frameIndex}_hidden_states" traceStep.HiddenStates
+                traceCurrent <- greedyAudioFrame traceStep.Logits traceStep.HiddenStates
+                traceInput <- frameToInputIds traceCurrent
+                writeDebugInt64 outputDir infos $"trace_frame_{frameIndex}_ids" traceCurrent
+                writeDebugFloat outputDir infos $"trace_state_{frameIndex}_attention_mask" traceState.AttentionMask
+                writeDebugInt64 outputDir infos $"trace_state_{frameIndex}_thinker_input_ids" traceState.ThinkerInputIds
+                writeDebugInt64 outputDir infos $"trace_state_{frameIndex}_thinker_attention_mask" traceState.ThinkerAttentionMask
+                writeDebugInt64 outputDir infos $"trace_state_{frameIndex}_thinker_cache_position" traceState.ThinkerCachePosition
+                writeDebugInt64 outputDir infos $"trace_state_{frameIndex}_thinker_eos" traceState.ThinkerEos
+            finally
+                (traceStep :> IDisposable).Dispose()
 
         let manifestJson =
             JsonSerializer.Serialize(
@@ -866,47 +1049,72 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
 
         let frames = ResizeArray<int64>(maxNewFrames * audioNumCodebooks)
         let stepKinds = ResizeArray<string>()
-        let mutable current = greedyAudioFrame prefill.Logits prefill.HiddenStates
-        appendFrame frames current
-        stepKinds.Add("prefill")
         let mutable state = prefill.State
-        let mutable currentInput = frameToInputIds current
-        let mutable stopReason = if frameIsEos current then "eos" else "max_frames"
-        let mutable useThinker = false
+        let mutable stateIsLive = true
+        let disposeCurrentState () =
+            if stateIsLive then
+                stateIsLive <- false
+                (state :> IDisposable).Dispose()
 
-        while frameCount frames < maxNewFrames && stopReason <> "eos" do
-            let mutable stepKind = "frame"
-            let step =
-                if useThinker && tensorContainsInt64 0L state.ThinkerEos then
-                    useThinker <- false
-                    stepKind <- "thinker"
-                    runBackboneThinkerStep currentInput state
-                else
-                    useThinker <- tensorContainsInt64 0L state.ThinkerEos
-                    runBackboneFrameStep currentInput state
+        try
+            let mutable current =
+                try
+                    greedyAudioFrame prefill.Logits prefill.HiddenStates
+                finally
+                    (prefill :> IDisposable).Dispose()
 
-            state <- step.State
-            current <- greedyAudioFrame step.Logits step.HiddenStates
-            if frameHasAnyNonZero current then
-                appendFrame frames current
-                stepKinds.Add(stepKind)
-            currentInput <- frameToInputIds current
-            if frameIsEos current then
-                stopReason <- "eos"
+            appendFrame frames current
+            stepKinds.Add("prefill")
+            let mutable currentInput = frameToInputIds current
+            let mutable stopReason = if frameIsEos current then "eos" else "max_frames"
+            let mutable useThinker = false
 
-        timings["generateMs"] <- stopwatch.Elapsed.TotalMilliseconds - timings["prefillMs"]
-        let codes = framesToCodecTensor frames
-        let decodeWatch = Stopwatch.StartNew()
-        let audio = runCodecDecode codes
-        timings["decodeMs"] <- decodeWatch.Elapsed.TotalMilliseconds
-        timings["totalMs"] <- stopwatch.Elapsed.TotalMilliseconds
+            while frameCount frames < maxNewFrames && stopReason <> "eos" do
+                let mutable stepKind = "frame"
+                let step =
+                    if useThinker && tensorContainsInt64 0L state.ThinkerEos then
+                        useThinker <- false
+                        stepKind <- "thinker"
+                        runBackboneThinkerStep currentInput state
+                    else
+                        useThinker <- tensorContainsInt64 0L state.ThinkerEos
+                        runBackboneFrameStep true currentInput state
 
-        { AudioCodes = codes
-          AudioValues = audio
-          FrameCount = frameCount frames
-          StopReason = stopReason
-          StepKinds = stepKinds.ToArray()
-          Timings = timings }
+                let previousState = state
+                state <- step.State
+                stateIsLive <- true
+                try
+                    (previousState :> IDisposable).Dispose()
+                    current <- greedyAudioFrame step.Logits step.HiddenStates
+                finally
+                    (step :> IDisposable).Dispose()
+
+                if frameHasAnyNonZero current then
+                    appendFrame frames current
+                    stepKinds.Add(stepKind)
+                currentInput <- frameToInputIds current
+                if frameIsEos current then
+                    stopReason <- "eos"
+
+            timings["generateMs"] <- stopwatch.Elapsed.TotalMilliseconds - timings["prefillMs"]
+            let codes = framesToCodecTensor frames
+            disposeCurrentState ()
+            let decodeWatch = Stopwatch.StartNew()
+            let audio, audioOwner = runCodecDecode codes
+            timings["decodeMs"] <- decodeWatch.Elapsed.TotalMilliseconds
+            timings["totalMs"] <- stopwatch.Elapsed.TotalMilliseconds
+
+            { AudioCodes = codes
+              AudioValues = audio
+              FrameCount = frameCount frames
+              StopReason = stopReason
+              StepKinds = stepKinds.ToArray()
+              Timings = timings
+              OwnedBuffers = [| audioOwner |] }
+        with
+        | _ ->
+            disposeCurrentState ()
+            reraise()
 
     interface IDisposable with
         member _.Dispose() =

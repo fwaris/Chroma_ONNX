@@ -456,7 +456,7 @@ module S2sServe =
         let backendDir = Path.Combine(session.WorkDir, backend)
         Directory.CreateDirectory(backendDir) |> ignore
         let memoryBefore = RuntimeMemory.current()
-        let result = runner.Generate(prepared, session.MaxNewFrames)
+        use result = runner.Generate(prepared, session.MaxNewFrames)
         let memoryAfter = RuntimeMemory.current()
         let codesPath = Path.Combine(backendDir, "audio_codes.i64")
         let rawAudioPath = Path.Combine(backendDir, "audio_values.f32")

@@ -371,7 +371,7 @@ module Cli =
         let memoryBefore = RuntimeMemory.current()
         use runner = new ChromaS2sOnnxRunner(modelDir, bundleDir, executionProvider, memoryMode, tuningOptions)
         let memoryAfterLoad = RuntimeMemory.current()
-        let result = runner.Generate(prepared, frames)
+        use result = runner.Generate(prepared, frames)
         let memoryAfterGenerate = RuntimeMemory.current()
         stopwatch.Stop()
 
@@ -470,7 +470,7 @@ module Cli =
         let memoryAfterCreate = RuntimeMemory.current()
 
         for warmupIndex in 1 .. warmup do
-            let warmupResult = runner.Generate(prepared, frames)
+            use warmupResult = runner.Generate(prepared, frames)
             let totalMs =
                 match warmupResult.Timings.TryGetValue "totalMs" with
                 | true, value -> value
@@ -480,30 +480,48 @@ module Cli =
 
         let memoryAfterWarmup = RuntimeMemory.current()
         let mutable lastResult: S2sGenerationResult option = None
+        let disposeLastResult () =
+            match lastResult with
+            | Some result ->
+                (result :> IDisposable).Dispose()
+                lastResult <- None
+            | None -> ()
+
         let benchmarkStopwatch = Stopwatch.StartNew()
         let iterations =
-            [| for iterationIndex in 1 .. iterationCount do
-                   let stopwatch = Stopwatch.StartNew()
-                   let result = runner.Generate(prepared, frames)
-                   stopwatch.Stop()
-                   lastResult <- Some result
-                   yield
-                       { Iteration = iterationIndex
-                         WallClockMs = stopwatch.Elapsed.TotalMilliseconds
-                         TimingsMs = Dictionary<string, float>(result.Timings)
-                         FrameCount = result.FrameCount
-                         StopReason = result.StopReason
-                         AudioCodesShape = result.AudioCodes.Dimensions.ToArray()
-                         AudioValuesShape = result.AudioValues.Dimensions.ToArray() } |]
+            try
+                [| for iterationIndex in 1 .. iterationCount do
+                       let stopwatch = Stopwatch.StartNew()
+                       let result = runner.Generate(prepared, frames)
+                       stopwatch.Stop()
+                       let previousResult = lastResult
+                       lastResult <- Some result
+                       previousResult
+                       |> Option.iter (fun previous -> (previous :> IDisposable).Dispose())
+                       yield
+                           { Iteration = iterationIndex
+                             WallClockMs = stopwatch.Elapsed.TotalMilliseconds
+                             TimingsMs = Dictionary<string, float>(result.Timings)
+                             FrameCount = result.FrameCount
+                             StopReason = result.StopReason
+                             AudioCodesShape = result.AudioCodes.Dimensions.ToArray()
+                             AudioValuesShape = result.AudioValues.Dimensions.ToArray() } |]
+            with
+            | _ ->
+                disposeLastResult ()
+                reraise()
         benchmarkStopwatch.Stop()
         let memoryAfterBenchmark = RuntimeMemory.current()
 
-        match lastResult with
-        | Some result ->
-            TensorIO.writeInt64s (Path.Combine(outputDir, "last_audio_codes.i64")) result.AudioCodes
-            TensorIO.writeSingles (Path.Combine(outputDir, "last_audio_values.f32")) result.AudioValues
-            Wave.writeMono16 (Path.Combine(outputDir, "last_audio.wav")) 24000 result.AudioValues |> ignore
-        | None -> ()
+        try
+            match lastResult with
+            | Some result ->
+                TensorIO.writeInt64s (Path.Combine(outputDir, "last_audio_codes.i64")) result.AudioCodes
+                TensorIO.writeSingles (Path.Combine(outputDir, "last_audio_values.f32")) result.AudioValues
+                Wave.writeMono16 (Path.Combine(outputDir, "last_audio.wav")) 24000 result.AudioValues |> ignore
+            | None -> ()
+        finally
+            disposeLastResult ()
 
         let details =
             {| backend = "fsharp_onnx"
@@ -798,7 +816,7 @@ module Cli =
                 use runner = new ChromaS2sOnnxRunner(modelDir, bundleDir, executionProvider, memoryMode, tuningOptions)
                 let afterRunnerCreate = RuntimeMemory.current()
                 let stopwatch = Stopwatch.StartNew()
-                let result = runner.Generate(prepared, frames)
+                use result = runner.Generate(prepared, frames)
                 stopwatch.Stop()
                 let afterGenerate = RuntimeMemory.current()
 

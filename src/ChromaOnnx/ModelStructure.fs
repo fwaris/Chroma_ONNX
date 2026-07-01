@@ -44,6 +44,30 @@ module RentedTensorBuffer =
 
         new RentedTensorBuffer<'T>(ArrayPool<'T>.Shared.Rent(count), count, clearOnReturn)
 
+type OwnedBufferGroup(ownedBuffers: IDisposable array) =
+    let mutable ownedBuffers = ownedBuffers
+    let mutable disposed = false
+
+    member _.Transfer() =
+        if disposed then
+            invalidOp "Owned buffer group has been disposed."
+
+        let transferred = ownedBuffers
+        ownedBuffers <- Array.empty
+        new OwnedBufferGroup(transferred)
+
+    interface IDisposable with
+        member _.Dispose() =
+            if not disposed then
+                disposed <- true
+                for buffer in ownedBuffers do
+                    buffer.Dispose()
+                ownedBuffers <- Array.empty
+
+module OwnedBufferGroup =
+    let empty () = new OwnedBufferGroup(Array.empty)
+    let ofArray ownedBuffers = new OwnedBufferGroup(ownedBuffers)
+
 type NativeS2sPrepared
     (
         inputIds: DenseTensor<int64>,
@@ -132,12 +156,23 @@ type S2sGraphState =
       ThinkerCachePosition: DenseTensor<int64>
       ThinkerEos: DenseTensor<int64>
       BackboneCache: Dictionary<string, DenseTensor<float32>>
-      ThinkerCache: Dictionary<string, DenseTensor<float32>> }
+      ThinkerCache: Dictionary<string, DenseTensor<float32>>
+      BackboneOwnedBuffers: OwnedBufferGroup
+      ThinkerOwnedBuffers: OwnedBufferGroup }
+    interface IDisposable with
+        member this.Dispose() =
+            (this.BackboneOwnedBuffers :> IDisposable).Dispose()
+            (this.ThinkerOwnedBuffers :> IDisposable).Dispose()
 
 type S2sBackboneStep =
     { Logits: DenseTensor<float32>
       HiddenStates: DenseTensor<float32>
-      State: S2sGraphState }
+      State: S2sGraphState
+      OwnedBuffers: IDisposable array }
+    interface IDisposable with
+        member this.Dispose() =
+            for buffer in this.OwnedBuffers do
+                buffer.Dispose()
 
 type S2sGenerationResult =
     { AudioCodes: DenseTensor<int64>
@@ -145,7 +180,12 @@ type S2sGenerationResult =
       FrameCount: int
       StopReason: string
       StepKinds: string array
-      Timings: Dictionary<string, float> }
+      Timings: Dictionary<string, float>
+      OwnedBuffers: IDisposable array }
+    interface IDisposable with
+        member this.Dispose() =
+            for buffer in this.OwnedBuffers do
+                buffer.Dispose()
 
 type DebugTensorInfo =
     { File: string

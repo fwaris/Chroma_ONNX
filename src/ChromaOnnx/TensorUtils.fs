@@ -91,6 +91,46 @@ module TensorIO =
     let cloneInt64Tensor (tensor: Microsoft.ML.OnnxRuntime.Tensors.Tensor<int64>) =
         DenseTensor<int64>(Enumerable.ToArray(tensor), tensor.Dimensions.ToArray())
 
+    let cloneFloatTensorOwned (tensor: Microsoft.ML.OnnxRuntime.Tensors.Tensor<float32>) =
+        let dimensions = tensor.Dimensions.ToArray()
+        let count = elementCount tensor.Dimensions
+        let buffer = RentedTensorBuffer.rent<float32> count false
+        try
+            let destination = buffer.Memory.Span
+            match tensor with
+            | :? DenseTensor<float32> as dense when isContiguous dense ->
+                dense.Buffer.Span.Slice(0, count).CopyTo(destination)
+            | _ ->
+                let mutable index = 0
+                for value in tensor do
+                    destination[index] <- value
+                    index <- index + 1
+            DenseTensor<float32>(buffer.Memory, ReadOnlySpan<int>(dimensions), false), buffer :> IDisposable
+        with
+        | _ ->
+            (buffer :> IDisposable).Dispose()
+            reraise()
+
+    let cloneInt64TensorOwned (tensor: Microsoft.ML.OnnxRuntime.Tensors.Tensor<int64>) =
+        let dimensions = tensor.Dimensions.ToArray()
+        let count = elementCount tensor.Dimensions
+        let buffer = RentedTensorBuffer.rent<int64> count false
+        try
+            let destination = buffer.Memory.Span
+            match tensor with
+            | :? DenseTensor<int64> as dense when isContiguous dense ->
+                dense.Buffer.Span.Slice(0, count).CopyTo(destination)
+            | _ ->
+                let mutable index = 0
+                for value in tensor do
+                    destination[index] <- value
+                    index <- index + 1
+            DenseTensor<int64>(buffer.Memory, ReadOnlySpan<int>(dimensions), false), buffer :> IDisposable
+        with
+        | _ ->
+            (buffer :> IDisposable).Dispose()
+            reraise()
+
 module Manifest =
     let private tryGetInt (name: string) (root: JsonElement) =
         match root.TryGetProperty(name) with
