@@ -3,6 +3,7 @@ namespace ChromaOnnx
 open System
 open System.IO
 open System.Linq
+open System.Runtime.InteropServices
 open System.Text.Json
 open Microsoft.ML.OnnxRuntime.Tensors
 
@@ -14,6 +15,27 @@ module TensorIO =
         match Path.GetDirectoryName(Path.GetFullPath(path)) with
         | null | "" -> ()
         | directory -> Directory.CreateDirectory(directory) |> ignore
+
+    let private elementCount (dimensions: ReadOnlySpan<int>) =
+        let mutable count = 1
+        for dimension in dimensions do
+            count <- count * dimension
+        count
+
+    let private isContiguous (tensor: DenseTensor<'T>) =
+        let dimensions = tensor.Dimensions
+        let strides = tensor.Strides
+        let mutable expectedStride = 1
+        let mutable index = dimensions.Length - 1
+        let mutable contiguous = true
+
+        while contiguous && index >= 0 do
+            if strides[index] <> expectedStride then
+                contiguous <- false
+            expectedStride <- expectedStride * dimensions[index]
+            index <- index - 1
+
+        contiguous
 
     let readSingles (path: string) (count: int) =
         let bytes = File.ReadAllBytes path
@@ -42,18 +64,26 @@ module TensorIO =
         DenseTensor<int64>(data, dims)
 
     let writeSingles (path: string) (tensor: DenseTensor<float32>) =
-        let data = Enumerable.ToArray(tensor)
-        let bytes = Array.zeroCreate<byte> (data.Length * sizeof<float32>)
-        Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length)
         ensureParentDirectory path
-        File.WriteAllBytes(path, bytes)
+        if isContiguous tensor then
+            let data = tensor.Buffer.Span.Slice(0, elementCount tensor.Dimensions)
+            File.WriteAllBytes(path, MemoryMarshal.AsBytes(data))
+        else
+            let data = Enumerable.ToArray(tensor)
+            let bytes = Array.zeroCreate<byte> (data.Length * sizeof<float32>)
+            Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length)
+            File.WriteAllBytes(path, bytes)
 
     let writeInt64s (path: string) (tensor: DenseTensor<int64>) =
-        let data = Enumerable.ToArray(tensor)
-        let bytes = Array.zeroCreate<byte> (data.Length * sizeof<int64>)
-        Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length)
         ensureParentDirectory path
-        File.WriteAllBytes(path, bytes)
+        if isContiguous tensor then
+            let data = tensor.Buffer.Span.Slice(0, elementCount tensor.Dimensions)
+            File.WriteAllBytes(path, MemoryMarshal.AsBytes(data))
+        else
+            let data = Enumerable.ToArray(tensor)
+            let bytes = Array.zeroCreate<byte> (data.Length * sizeof<int64>)
+            Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length)
+            File.WriteAllBytes(path, bytes)
 
     let cloneFloatTensor (tensor: Microsoft.ML.OnnxRuntime.Tensors.Tensor<float32>) =
         DenseTensor<float32>(Enumerable.ToArray(tensor), tensor.Dimensions.ToArray())

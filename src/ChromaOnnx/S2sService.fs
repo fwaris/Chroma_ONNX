@@ -625,12 +625,13 @@ module S2sServe =
                                 do! sendJson socket {| ``type`` = "turn.accepted"; id = session.Id |}
                             | "turn.end" ->
                                 try
-                                    let userAudio = processor.ReadFloat32PcmFromBytes(turnAudio.ToArray())
+                                    let turnAudioBytes = turnAudio.ToArray()
+                                    let userAudio = processor.ReadFloat32PcmFromBytes(turnAudioBytes)
                                     let requestedBackends =
                                         match session.Backend with
                                         | "both" -> [| "fsharp_onnx"; "python" |]
                                         | backend -> [| backend |]
-                                    File.WriteAllBytes(Path.Combine(session.WorkDir, "user_audio_16k.f32"), turnAudio.ToArray())
+                                    File.WriteAllBytes(Path.Combine(session.WorkDir, "user_audio_16k.f32"), turnAudioBytes)
                                     do! sendJson socket {| ``type`` = "generation.started"; id = session.Id; backend = session.Backend; backends = requestedBackends; maxNewFrames = session.MaxNewFrames |}
                                     do! generationLock.WaitAsync()
                                     let results = ResizeArray<JsonElement>()

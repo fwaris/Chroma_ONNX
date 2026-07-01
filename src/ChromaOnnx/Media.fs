@@ -27,7 +27,28 @@ module Wave =
 
         int16 (Math.Round(clamped * 32767.0))
 
-    let private stats (sampleRate: int) (data: float32 array) =
+    let private elementCount (dimensions: ReadOnlySpan<int>) =
+        let mutable count = 1
+        for dimension in dimensions do
+            count <- count * dimension
+        count
+
+    let private isContiguous (tensor: DenseTensor<'T>) =
+        let dimensions = tensor.Dimensions
+        let strides = tensor.Strides
+        let mutable expectedStride = 1
+        let mutable index = dimensions.Length - 1
+        let mutable contiguous = true
+
+        while contiguous && index >= 0 do
+            if strides[index] <> expectedStride then
+                contiguous <- false
+            expectedStride <- expectedStride * dimensions[index]
+            index <- index - 1
+
+        contiguous
+
+    let private stats (sampleRate: int) (data: Span<float32>) =
         if data.Length = 0 then
             {| PeakAbs = 0.0; Rms = 0.0; MeanAbs = 0.0; DurationSeconds = 0.0 |}
         else
@@ -35,8 +56,8 @@ module Wave =
             let mutable sumSquares = 0.0
             let mutable sumAbs = 0.0
 
-            for sample in data do
-                let value = float sample
+            for index in 0 .. data.Length - 1 do
+                let value = float data[index]
                 let absValue = Math.Abs(value)
                 peakAbs <- max peakAbs absValue
                 sumSquares <- sumSquares + value * value
@@ -47,8 +68,7 @@ module Wave =
                MeanAbs = sumAbs / float data.Length
                DurationSeconds = float data.Length / float sampleRate |}
 
-    let writeMono16 (path: string) (sampleRate: int) (tensor: DenseTensor<float32>) =
-        let data = Enumerable.ToArray(tensor)
+    let private writeMono16Span (path: string) (sampleRate: int) (data: Span<float32>) =
         let dataBytes = data.Length * sizeof<int16>
         let audioStats = stats sampleRate data
         let wavPreviewGain =
@@ -77,8 +97,8 @@ module Wave =
         writeAscii writer "data"
         writer.Write(dataBytes)
 
-        for sample in data do
-            writer.Write(clamp16 (float sample * wavPreviewGain))
+        for index in 0 .. data.Length - 1 do
+            writer.Write(clamp16 (float data[index] * wavPreviewGain))
 
         { Samples = data.Length
           DurationSeconds = audioStats.DurationSeconds
@@ -87,4 +107,11 @@ module Wave =
           MeanAbs = audioStats.MeanAbs
           WavPreviewGain = wavPreviewGain
           WavPeakAbs = min 1.0 (audioStats.PeakAbs * wavPreviewGain) }
+
+    let writeMono16 (path: string) (sampleRate: int) (tensor: DenseTensor<float32>) =
+        if isContiguous tensor then
+            writeMono16Span path sampleRate (tensor.Buffer.Span.Slice(0, elementCount tensor.Dimensions))
+        else
+            let data = Enumerable.ToArray(tensor)
+            writeMono16Span path sampleRate (data.AsSpan())
 
