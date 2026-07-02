@@ -500,6 +500,7 @@ dotnet run --project src\ChromaOnnx -- s2s-serve `
   --ort-memory-profile quality-safe `
   --thinker-active-frames 0 `
   --stream-decode-frames 4 `
+  --codec-stall-guard-frames 16 `
   --max-queue-length 32 `
   --max-prompt-audio-seconds 60 `
   --max-turn-audio-seconds 60 `
@@ -533,6 +534,8 @@ API shape:
 ChromaS2SONNX queues generation FIFO and runs one F#/ONNX audio-processing job at a time. Response audio streaming is available for `F#/ONNX`; the Python comparison backend remains final-result only. On CUDA, the service defaults leave VRAM headroom by capping the ORT CUDA arena and deferring partial audio decode when free VRAM is below the configured threshold.
 
 The browser lab asks for max response seconds and converts that to Chroma audio frames at roughly 12.5 frames per second. If a run reports `stopReason: "max_frames"` or `truncatedByMaxFrames: true`, increase the response seconds; EOS means the model completed naturally.
+
+The service also has a repeated-codec-frame guard for degenerate outputs that turn into near-silent repeated audio before EOS. `--codec-stall-guard-frames 16` stops after 16 repeated generated codec frames once at least 50 frames have been produced; use `0` to disable it. These runs report `stopReason: "codec_stall"` and include `stalledByCodecPattern` plus stall timing fields in details.
 
 Important WebSocket events:
 

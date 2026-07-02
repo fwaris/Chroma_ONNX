@@ -677,6 +677,7 @@ module S2sServe =
         (runner: ChromaS2sOnnxRunner)
         streamDecodeFrames
         streamMinFreeVramMb
+        codecStallGuardFrames
         (shouldDecodeChunk: int -> bool)
         (onFrame: S2sGeneratedFrame -> unit)
         (onAudioChunk: S2sAudioChunk -> unit)
@@ -697,7 +698,8 @@ module S2sServe =
                 onFrame,
                 onAudioChunk,
                 cancellationToken,
-                ?shouldDecodeChunk = Some shouldDecodeChunk
+                ?shouldDecodeChunk = Some shouldDecodeChunk,
+                ?codecStallGuardFrames = Some codecStallGuardFrames
             )
         let memoryAfter = RuntimeMemory.current()
         let codesPath = Path.Combine(backendDir, "audio_codes.i64")
@@ -746,14 +748,21 @@ module S2sServe =
                generationFrameRateFps = generationFrameRateFps
                stopReason = result.StopReason
                truncatedByMaxFrames = truncatedByMaxFrames
+               stalledByCodecPattern = result.StopReason = "codec_stall"
                truncationWarning =
                    if truncatedByMaxFrames then
                        $"Generation reached maxNewFrames ({session.MaxNewFrames}, about {Math.Round(float session.MaxNewFrames * 0.08, 2)} seconds) before EOS."
                    else
                        ""
+               stallWarning =
+                   if result.StopReason = "codec_stall" then
+                       $"Generation stopped after {codecStallGuardFrames} consecutive repeated codec frames, which usually indicates repeated near-silence."
+                   else
+                       ""
                stepKinds = result.StepKinds
                streamDecodeFrames = streamDecodeFrames
                streamMinFreeVramMb = streamMinFreeVramMb
+               codecStallGuardFrames = codecStallGuardFrames
                audioCodesShape = dimsOf result.AudioCodes
                audioValuesShape = dimsOf result.AudioValues
                timingsMs = result.Timings
@@ -845,6 +854,7 @@ module S2sServe =
         pythonThinkerActiveFrames
         streamDecodeFrames
         streamMinFreeVramMb
+        codecStallGuardFrames
         maxTurnAudioSamples
         (workQueue: StreamingWorkQueue)
         (store: S2sSessionStore)
@@ -908,6 +918,7 @@ module S2sServe =
                                maxNewFrames = session.MaxNewFrames
                                streamDecodeFrames = streamDecodeFrames
                                streamMinFreeVramMb = streamMinFreeVramMb
+                               codecStallGuardFrames = codecStallGuardFrames
                                cudaGpuMemLimitMb = runner.CudaGpuMemLimitMb |> Option.toNullable
                                queueLength = workQueue.QueueLength
                                maxQueueLength = workQueue.MaxQueueLength |}
@@ -981,7 +992,8 @@ module S2sServe =
                                                            backends = requestedBackends
                                                            maxNewFrames = session.MaxNewFrames
                                                            streamDecodeFrames = streamDecodeFrames
-                                                           streamMinFreeVramMb = streamMinFreeVramMb |}
+                                                           streamMinFreeVramMb = streamMinFreeVramMb
+                                                           codecStallGuardFrames = codecStallGuardFrames |}
                                                 let results = ResizeArray<JsonElement>()
 
                                                 if requestedBackends |> Array.contains "fsharp_onnx" then
@@ -1039,6 +1051,7 @@ module S2sServe =
                                                             runner
                                                             streamDecodeFrames
                                                             streamMinFreeVramMb
+                                                            codecStallGuardFrames
                                                             shouldDecodeChunk
                                                             onFrame
                                                             onAudioChunk
@@ -1077,6 +1090,7 @@ module S2sServe =
                                                        maxNewFrames = session.MaxNewFrames
                                                        streamDecodeFrames = streamDecodeFrames
                                                        streamMinFreeVramMb = streamMinFreeVramMb
+                                                       codecStallGuardFrames = codecStallGuardFrames
                                                        pythonInRequestPath = requestedBackends |> Array.contains "python"
                                                        results = results.ToArray() |}
                                                 let detailsJson = JsonSerializer.Serialize(details, jsonOptions)
@@ -1185,6 +1199,7 @@ module S2sServe =
         let pythonDevice = optional (if executionProvider.Equals("cuda", StringComparison.OrdinalIgnoreCase) then "cuda" else "cpu") "--python-device" args
         let streamDecodeFrames = optional "8" "--stream-decode-frames" args |> int |> max 1
         let streamMinFreeVramMb = optional "1024" "--stream-min-free-vram-mb" args |> int |> max 0
+        let codecStallGuardFrames = optional "16" "--codec-stall-guard-frames" args |> int |> max 0
         let maxQueueLength = optional "32" "--max-queue-length" args |> int |> max 0
         let maxPromptAudioSeconds =
             optional "60" "--max-prompt-audio-seconds" args
@@ -1248,6 +1263,7 @@ module S2sServe =
                            maxQueueLength = workQueue.MaxQueueLength
                            streamDecodeFrames = streamDecodeFrames
                            streamMinFreeVramMb = streamMinFreeVramMb
+                           codecStallGuardFrames = codecStallGuardFrames
                            maxPromptAudioSeconds = maxPromptAudioSeconds
                            maxTurnAudioSeconds = maxTurnAudioSeconds
                            globalGpuMemory = RuntimeMemory.tryGlobalGpuMemory() |> Option.toObj
@@ -1271,7 +1287,7 @@ module S2sServe =
                 })
         ) |> ignore
         app.MapPost("/api/s2s/sessions", RequestDelegate(fun ctx -> createSession processor maxPromptAudioSamples store ctx)) |> ignore
-        app.MapGet("/ws/s2s/{id}", RequestDelegate(fun ctx -> handleSocket processor runner modelDir python pythonDevice thinkerActiveFramesArg streamDecodeFrames streamMinFreeVramMb maxTurnAudioSamples workQueue store ctx)) |> ignore
+        app.MapGet("/ws/s2s/{id}", RequestDelegate(fun ctx -> handleSocket processor runner modelDir python pythonDevice thinkerActiveFramesArg streamDecodeFrames streamMinFreeVramMb codecStallGuardFrames maxTurnAudioSamples workQueue store ctx)) |> ignore
         app.MapGet("/api/s2s/sessions/{id}/details.json", RequestDelegate(fun ctx -> serveSessionFile store "details.json" "application/json; charset=utf-8" ctx)) |> ignore
         app.MapGet("/api/s2s/sessions/{id}/audio.wav", RequestDelegate(fun ctx -> serveSessionFile store "audio.wav" "audio/wav" ctx)) |> ignore
         app.MapGet("/api/s2s/sessions/{id}/{backend}/details.json", RequestDelegate(fun ctx -> serveBackendSessionFile store "details.json" "application/json; charset=utf-8" ctx)) |> ignore
@@ -1287,6 +1303,7 @@ module S2sServe =
         | None -> ()
         printfn "Stream decode frames: %d" streamDecodeFrames
         printfn "Stream min free VRAM: %d MiB" streamMinFreeVramMb
+        printfn "Codec stall guard frames: %d" codecStallGuardFrames
         printfn "Max queue length: %d" workQueue.MaxQueueLength
         printfn "Thinker features: %s" processor.ThinkerFeatureMode
         if runner.OptimizedModelCacheEnabled then

@@ -662,6 +662,20 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
 
         found
 
+    let frameArraysEqual (left: int64 array) (right: int64 array) =
+        if left.Length <> right.Length then
+            false
+        else
+            let mutable equal = true
+            let mutable index = 0
+
+            while equal && index < left.Length do
+                if left[index] <> right[index] then
+                    equal <- false
+                index <- index + 1
+
+            equal
+
     let tensorContainsInt64 value (tensor: DenseTensor<int64>) =
         let values = tensor.Buffer.Span
         let mutable found = false
@@ -1078,13 +1092,16 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
             onFrame: S2sGeneratedFrame -> unit,
             onAudioChunk: S2sAudioChunk -> unit,
             cancellationToken: CancellationToken,
-            ?shouldDecodeChunk: int -> bool
+            ?shouldDecodeChunk: int -> bool,
+            ?codecStallGuardFrames: int
         ) =
         this.EnsureReady()
         if maxNewFrames < 1 then
             invalidArg (nameof maxNewFrames) "maxNewFrames must be positive."
 
         let streamDecodeFrames = max 1 streamDecodeFrames
+        let codecStallGuardFrames = defaultArg codecStallGuardFrames 0 |> max 0
+        let codecStallMinFrames = 50
         let timings = Dictionary<string, float>(StringComparer.Ordinal)
         let stopwatch = Stopwatch.StartNew()
         let shouldDecodeChunk = defaultArg shouldDecodeChunk (fun _ -> true)
@@ -1100,6 +1117,12 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         let mutable chunkIndex = 0
         let mutable decodeMs = 0.0
         let mutable streamDecodeSkips = 0
+        let mutable previousStallFrame = Array.empty<int64>
+        let mutable hasPreviousStallFrame = false
+        let mutable repeatedFrameRunFrames = 0
+        let mutable repeatedFrameRunStartFrame = -1
+        let mutable maxRepeatedFrameRunFrames = 0
+        let mutable stallStartFrame = -1
         let mutable state = prefill.State
         let mutable stateIsLive = true
         let disposeCurrentState () =
@@ -1144,6 +1167,31 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
                 streamDecodeSkips <- streamDecodeSkips + 1
                 nextStreamDecodeFrame <- currentFrameCount + streamDecodeFrames
 
+        let updateCodecStallGuard (frame: DenseTensor<int64>) =
+            if codecStallGuardFrames <= 0 || frameIsEos frame then
+                false
+            else
+                let frameIndex = frameCount frames - 1
+                let currentFrame = frameToArray frame
+                let isRepeat = hasPreviousStallFrame && frameArraysEqual previousStallFrame currentFrame
+
+                if isRepeat then
+                    repeatedFrameRunFrames <- repeatedFrameRunFrames + 1
+                    maxRepeatedFrameRunFrames <- max maxRepeatedFrameRunFrames repeatedFrameRunFrames
+
+                    if frameCount frames >= codecStallMinFrames && repeatedFrameRunFrames >= codecStallGuardFrames then
+                        stallStartFrame <- repeatedFrameRunStartFrame
+                        true
+                    else
+                        false
+                else
+                    previousStallFrame <- currentFrame
+                    hasPreviousStallFrame <- true
+                    repeatedFrameRunFrames <- 1
+                    repeatedFrameRunStartFrame <- frameIndex
+                    maxRepeatedFrameRunFrames <- max maxRepeatedFrameRunFrames repeatedFrameRunFrames
+                    false
+
         try
             let mutable current =
                 try
@@ -1157,9 +1205,11 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
             emitDecodedChunk false
             let mutable currentInput = frameToInputIds current
             let mutable stopReason = if frameIsEos current then "eos" else "max_frames"
+            if stopReason <> "eos" then
+                updateCodecStallGuard current |> ignore
             let mutable useThinker = false
 
-            while frameCount frames < maxNewFrames && stopReason <> "eos" do
+            while frameCount frames < maxNewFrames && stopReason = "max_frames" do
                 cancellationToken.ThrowIfCancellationRequested()
                 let mutable stepKind = "frame"
                 let step =
@@ -1185,6 +1235,8 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
                     stepKinds.Add(stepKind)
                     emitFrame stepKind current
                     emitDecodedChunk false
+                    if stopReason <> "eos" && updateCodecStallGuard current then
+                        stopReason <- "codec_stall"
                 currentInput <- frameToInputIds current
                 if frameIsEos current then
                     stopReason <- "eos"
@@ -1211,6 +1263,11 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
                     emittedFrameStart <- frameCount frames
                 timings["decodeMs"] <- decodeMs
                 timings["streamDecodeSkips"] <- float streamDecodeSkips
+                timings["maxRepeatedFrameRunFrames"] <- float maxRepeatedFrameRunFrames
+                timings["codecStallGuardFrames"] <- float codecStallGuardFrames
+                timings["codecStallMinFrames"] <- float codecStallMinFrames
+                if stallStartFrame >= 0 then
+                    timings["codecStallStartFrame"] <- float stallStartFrame
                 timings["totalMs"] <- stopwatch.Elapsed.TotalMilliseconds
 
                 { AudioCodes = codes
