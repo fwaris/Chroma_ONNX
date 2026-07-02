@@ -176,12 +176,18 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         | "cuda" ->
             if useQualitySafeOrtMemoryProfile then
                 let cudaOptions = new OrtCUDAProviderOptions()
-                cudaOptions.UpdateOptions(
+                let cudaOptionValues =
                     Dictionary<string, string>(
                         dict [ "device_id", "0"
                                "arena_extend_strategy", "kSameAsRequested"
                                "use_tf32", "0" ]
                     )
+                tuningOptions.CudaGpuMemLimitMb
+                |> Option.iter (fun limitMb ->
+                    if limitMb > 0 then
+                        cudaOptionValues["gpu_mem_limit"] <- string (int64 limitMb * 1024L * 1024L))
+                cudaOptions.UpdateOptions(
+                    cudaOptionValues
                 )
                 options.AppendExecutionProvider_CUDA(cudaOptions)
                 cudaOptions.Dispose()
@@ -892,6 +898,8 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
 
     member _.OptimizedModelCacheFormat = normalizedOptimizedModelCacheFormat
 
+    member _.CudaGpuMemLimitMb = tuningOptions.CudaGpuMemLimitMb
+
     member _.MappedShardCount =
         store
         |> Option.map (fun value -> value.MappedShardCount)
@@ -1069,7 +1077,8 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
             streamDecodeFrames: int,
             onFrame: S2sGeneratedFrame -> unit,
             onAudioChunk: S2sAudioChunk -> unit,
-            cancellationToken: CancellationToken
+            cancellationToken: CancellationToken,
+            ?shouldDecodeChunk: int -> bool
         ) =
         this.EnsureReady()
         if maxNewFrames < 1 then
@@ -1078,6 +1087,7 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         let streamDecodeFrames = max 1 streamDecodeFrames
         let timings = Dictionary<string, float>(StringComparer.Ordinal)
         let stopwatch = Stopwatch.StartNew()
+        let shouldDecodeChunk = defaultArg shouldDecodeChunk (fun _ -> true)
         cancellationToken.ThrowIfCancellationRequested()
         let prefill = runGeneratePrefill prepared
         timings["prefillMs"] <- stopwatch.Elapsed.TotalMilliseconds
@@ -1085,9 +1095,11 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         let frames = ResizeArray<int64>(maxNewFrames * audioNumCodebooks)
         let stepKinds = ResizeArray<string>()
         let mutable emittedFrameStart = 0
+        let mutable nextStreamDecodeFrame = streamDecodeFrames
         let mutable emittedSampleStart = 0
         let mutable chunkIndex = 0
         let mutable decodeMs = 0.0
+        let mutable streamDecodeSkips = 0
         let mutable state = prefill.State
         let mutable stateIsLive = true
         let disposeCurrentState () =
@@ -1105,7 +1117,8 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         let emitDecodedChunk force =
             cancellationToken.ThrowIfCancellationRequested()
             let currentFrameCount = frameCount frames
-            if currentFrameCount > 0 && (force || currentFrameCount - emittedFrameStart >= streamDecodeFrames) then
+            let chunkIsDue = currentFrameCount > 0 && (force || currentFrameCount >= nextStreamDecodeFrame)
+            if chunkIsDue && (force || shouldDecodeChunk currentFrameCount) then
                 let codes = framesToCodecTensor frames
                 let decodeWatch = Stopwatch.StartNew()
                 let audio, audioOwner = runCodecDecode codes
@@ -1124,8 +1137,12 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
                         chunkIndex <- chunkIndex + 1
                         emittedSampleStart <- emittedSampleStart + samples.Length
                     emittedFrameStart <- currentFrameCount
+                    nextStreamDecodeFrame <- currentFrameCount + streamDecodeFrames
                 finally
                     audioOwner.Dispose()
+            elif chunkIsDue then
+                streamDecodeSkips <- streamDecodeSkips + 1
+                nextStreamDecodeFrame <- currentFrameCount + streamDecodeFrames
 
         try
             let mutable current =
@@ -1193,6 +1210,7 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
                     emittedSampleStart <- emittedSampleStart + finalSamples.Length
                     emittedFrameStart <- frameCount frames
                 timings["decodeMs"] <- decodeMs
+                timings["streamDecodeSkips"] <- float streamDecodeSkips
                 timings["totalMs"] <- stopwatch.Elapsed.TotalMilliseconds
 
                 { AudioCodes = codes

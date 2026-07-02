@@ -38,6 +38,14 @@ module ProcessRunner =
         }
 
 module RuntimeMemory =
+    type GpuGlobalSnapshot =
+        { TotalMb: int
+          UsedMb: int
+          FreeMb: int
+          TotalGb: float
+          UsedGb: float
+          FreeGb: float }
+
     type Snapshot =
         { ProcessId: int
           WorkingSetGb: float
@@ -48,6 +56,49 @@ module RuntimeMemory =
 
     let private gb bytes =
         Math.Round(float bytes / 1024.0 / 1024.0 / 1024.0, 3)
+
+    let private mbToGb mb =
+        Math.Round(float mb / 1024.0, 3)
+
+    let tryGlobalGpuMemory () =
+        try
+            let startInfo = ProcessStartInfo()
+            startInfo.FileName <- "nvidia-smi"
+            startInfo.UseShellExecute <- false
+            startInfo.RedirectStandardOutput <- true
+            startInfo.RedirectStandardError <- true
+            startInfo.CreateNoWindow <- true
+            startInfo.ArgumentList.Add("--query-gpu=memory.total,memory.used,memory.free")
+            startInfo.ArgumentList.Add("--format=csv,noheader,nounits")
+
+            use proc = new Process()
+            proc.StartInfo <- startInfo
+            if not (proc.Start()) then
+                None
+            elif proc.WaitForExit(1000) then
+                let output = proc.StandardOutput.ReadToEnd()
+                output.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+                |> Array.tryHead
+                |> Option.bind (fun line ->
+                    let parts = line.Split(',', StringSplitOptions.TrimEntries ||| StringSplitOptions.RemoveEmptyEntries)
+                    if parts.Length >= 3 then
+                        match Int32.TryParse(parts[0]), Int32.TryParse(parts[1]), Int32.TryParse(parts[2]) with
+                        | (true, totalMb), (true, usedMb), (true, freeMb) ->
+                            Some
+                                { TotalMb = totalMb
+                                  UsedMb = usedMb
+                                  FreeMb = freeMb
+                                  TotalGb = mbToGb totalMb
+                                  UsedGb = mbToGb usedMb
+                                  FreeGb = mbToGb freeMb }
+                        | _ -> None
+                    else
+                        None)
+            else
+                try proc.Kill(true) with _ -> ()
+                None
+        with _ ->
+            None
 
     let private tryCurrentGpuMemoryMb () =
         try

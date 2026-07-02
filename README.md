@@ -321,7 +321,9 @@ dotnet run --project src\ChromaOnnx -- s2s-serve `
   --memory-mode resident-merged `
   --ort-memory-profile quality-safe `
   --thinker-active-frames 0 `
-  --stream-decode-frames 4 `
+  --stream-decode-frames 8 `
+  --stream-min-free-vram-mb 1024 `
+  --cuda-gpu-mem-limit-mb 15360 `
   --max-queue-length 32 `
   --max-prompt-audio-seconds 60 `
   --max-turn-audio-seconds 60 `
@@ -528,12 +530,14 @@ API shape:
 - `GET /api/s2s/sessions/{id}/{backend}/audio.wav` returns generated WAV.
 - `GET /api/s2s/sessions/{id}/{backend}/details.json` returns run metadata.
 
-ChromaS2SONNX queues generation FIFO and runs one F#/ONNX audio-processing job at a time. Response audio streaming is available for `F#/ONNX`; the Python comparison backend remains final-result only.
+ChromaS2SONNX queues generation FIFO and runs one F#/ONNX audio-processing job at a time. Response audio streaming is available for `F#/ONNX`; the Python comparison backend remains final-result only. On CUDA, the service defaults leave VRAM headroom by capping the ORT CUDA arena and deferring partial audio decode when free VRAM is below the configured threshold.
+
+The browser lab asks for max response seconds and converts that to Chroma audio frames at roughly 12.5 frames per second. If a run reports `stopReason: "max_frames"` or `truncatedByMaxFrames: true`, increase the response seconds; EOS means the model completed naturally.
 
 Important WebSocket events:
 
 - Client sends `turn.start`, binary Float32LE PCM chunks, `turn.end`, and optionally `turn.cancel`.
-- Server sends `queue.enqueued`, `queue.updated`, `queue.started`, `generation.started`, `generation.frame`, `audio.chunk`, `generation.done`, `generation.canceled`, and `error`.
+- Server sends `queue.enqueued`, `queue.updated`, `queue.started`, `generation.started`, `generation.frame`, `audio.chunk`, `audio.deferred`, `generation.done`, `generation.canceled`, and `error`.
 - Each `audio.chunk` JSON event is followed by one binary Float32LE 24 kHz payload.
 
 The service path expects canonical audio:

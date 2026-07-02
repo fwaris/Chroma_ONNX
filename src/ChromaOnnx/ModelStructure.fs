@@ -213,10 +213,12 @@ type S2sDummyInput =
 type S2sOrtTuningOptions =
     { MemoryProfile: string
       OptimizedModelCacheDir: string option
-      OptimizedModelCacheFormat: string }
+      OptimizedModelCacheFormat: string
+      CudaGpuMemLimitMb: int option }
 
 module S2sOrtTuningOptions =
     let Default =
         { MemoryProfile = "quality-safe"
           OptimizedModelCacheDir = None
-          OptimizedModelCacheFormat = "onnx" }
+          OptimizedModelCacheFormat = "onnx"
+          CudaGpuMemLimitMb = None }

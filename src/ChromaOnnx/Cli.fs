@@ -101,7 +101,7 @@ module Cli =
         printfn "  ChromaOnnx e2e --onnx-dir onnx/chroma --input-ids ids.i64 --attention-mask mask.i64 --input-values audio.f32 --input-values-cutoffs cutoffs.i64 --batch 1 --text-seq 8 --audio-samples 24000 --output-codes codes.i64 [--output-audio audio.f32]"
         printfn "  ChromaOnnx shared-e2e --model-dir models/chroma-4b --bundle-dir onnx/chroma-shared --input-ids ids.i64 --attention-mask mask.i64 --input-values audio.f32 --input-values-cutoffs cutoffs.i64 --batch 1 --text-seq 8 --audio-samples 24000 --output-codes codes.i64 [--output-audio audio.f32]"
         printfn "  ChromaOnnx serve --model-dir models/chroma-4b --bundle-dir onnx/chroma-shared --work-dir served_runs --port 5055 --python .venv/Scripts/python.exe"
-        printfn "  ChromaOnnx s2s-serve --model-dir models/chroma-4b --bundle-dir onnx/chroma-s2s --work-dir served_runs --port 5055 --execution-provider cuda --memory-mode resident-merged --ort-memory-profile quality-safe --thinker-active-frames 0 --stream-decode-frames 4 --max-queue-length 32 --max-prompt-audio-seconds 60 --max-turn-audio-seconds 60 --optimized-model-cache-dir onnx/chroma-s2s/ort-cache --optimized-model-cache-format onnx --python .venv/Scripts/python.exe --python-device cuda"
+        printfn "  ChromaOnnx s2s-serve --model-dir models/chroma-4b --bundle-dir onnx/chroma-s2s --work-dir served_runs --port 5055 --execution-provider cuda --memory-mode resident-merged --ort-memory-profile quality-safe --thinker-active-frames 0 --stream-decode-frames 8 --stream-min-free-vram-mb 1024 --cuda-gpu-mem-limit-mb 15360 --max-queue-length 32 --max-prompt-audio-seconds 60 --max-turn-audio-seconds 60 --optimized-model-cache-dir onnx/chroma-s2s/ort-cache --optimized-model-cache-format onnx --python .venv/Scripts/python.exe --python-device cuda"
         printfn "  ChromaOnnx s2s-offline --model-dir models/chroma-4b --bundle-dir onnx/chroma-s2s --prompt-text text --prompt-audio-f32 reference_24k.f32 --user-audio-f32 turn_16k.f32 --frames 8 --output-dir served_runs/offline/fsharp --execution-provider cuda --memory-mode resident-merged --ort-memory-profile quality-safe --thinker-active-frames 0"
         printfn "  ChromaOnnx s2s-debug-onnx --model-dir models/chroma-4b --bundle-dir onnx/chroma-s2s --prepared-dir served_runs/debug/prepared --output-dir served_runs/debug/onnx --execution-provider cuda --memory-mode resident-merged --ort-memory-profile quality-safe"
         printfn "  ChromaOnnx s2s-benchmark --model-dir models/chroma-4b --bundle-dir onnx/chroma-s2s --prompt-text text --prompt-audio-f32 reference_24k.f32 --user-audio-f32 turn_16k.f32 --frames 8 --warmup 1 --iterations 5 --output-dir served_runs/bench/fsharp --execution-provider cuda --memory-mode resident-merged --ort-memory-profile quality-safe --thinker-active-frames 0"
@@ -258,9 +258,13 @@ module Cli =
             let value = optional "" "--optimized-model-cache-dir" args
             if String.IsNullOrWhiteSpace value then None else Some(Path.GetFullPath value)
         let optimizedModelCacheFormat = optional "onnx" "--optimized-model-cache-format" args
+        let cudaGpuMemLimitMb =
+            let value = optional "" "--cuda-gpu-mem-limit-mb" args
+            if String.IsNullOrWhiteSpace value then None else Some(int value)
         { MemoryProfile = ortMemoryProfile
           OptimizedModelCacheDir = optimizedModelCacheDir
-          OptimizedModelCacheFormat = optimizedModelCacheFormat }
+          OptimizedModelCacheFormat = optimizedModelCacheFormat
+          CudaGpuMemLimitMb = cudaGpuMemLimitMb }
 
     let private createStandaloneOrtOptions (executionProvider: string) (tuningOptions: S2sOrtTuningOptions) =
         let options = new SessionOptions()
@@ -275,12 +279,18 @@ module Cli =
         | "cuda" ->
             if qualitySafe then
                 let cudaOptions = new OrtCUDAProviderOptions()
-                cudaOptions.UpdateOptions(
+                let cudaOptionValues =
                     Dictionary<string, string>(
                         dict [ "device_id", "0"
                                "arena_extend_strategy", "kSameAsRequested"
                                "use_tf32", "0" ]
                     )
+                tuningOptions.CudaGpuMemLimitMb
+                |> Option.iter (fun limitMb ->
+                    if limitMb > 0 then
+                        cudaOptionValues["gpu_mem_limit"] <- string (int64 limitMb * 1024L * 1024L))
+                cudaOptions.UpdateOptions(
+                    cudaOptionValues
                 )
                 options.AppendExecutionProvider_CUDA(cudaOptions)
                 cudaOptions.Dispose()
