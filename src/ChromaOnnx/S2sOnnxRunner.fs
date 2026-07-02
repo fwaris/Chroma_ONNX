@@ -7,6 +7,7 @@ open System.Diagnostics
 open System.IO
 open System.Runtime.InteropServices
 open System.Text.Json
+open System.Threading
 open Microsoft.ML.OnnxRuntime
 open Microsoft.ML.OnnxRuntime.Tensors
 
@@ -678,6 +679,20 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
                 values[codebookIndex * frameCount + frameIndex] <- frames[(frameIndex * audioNumCodebooks) + codebookIndex]
         DenseTensor<int64>(values, [| 1; audioNumCodebooks; frameCount |])
 
+    let frameToArray (frame: DenseTensor<int64>) =
+        let values = Array.zeroCreate<int64> audioNumCodebooks
+        copyFrameToSpan frame (values.AsSpan())
+        values
+
+    let audioSamplesFrom (startSample: int) (audio: DenseTensor<float32>) =
+        let totalSamples = tensorElementCount (audio.Dimensions.ToArray())
+        let startSample = max 0 (min startSample totalSamples)
+        let count = totalSamples - startSample
+        let samples = Array.zeroCreate<float32> count
+        if count > 0 then
+            audio.Buffer.Span.Slice(startSample, count).CopyTo(samples.AsSpan())
+        samples
+
     let runCodecDecode (audioCodes: DenseTensor<int64>) =
         let graphName = "codec_decode"
         let inputs = List<NamedOnnxValue>()
@@ -1038,23 +1053,79 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         File.WriteAllText(Path.Combine(outputDir, "debug_manifest.json"), manifestJson)
 
     member this.Generate(prepared: NativeS2sPrepared, maxNewFrames: int) =
+        this.GenerateStreaming(
+            prepared,
+            maxNewFrames,
+            Int32.MaxValue,
+            ignore,
+            ignore,
+            CancellationToken.None
+        )
+
+    member this.GenerateStreaming
+        (
+            prepared: NativeS2sPrepared,
+            maxNewFrames: int,
+            streamDecodeFrames: int,
+            onFrame: S2sGeneratedFrame -> unit,
+            onAudioChunk: S2sAudioChunk -> unit,
+            cancellationToken: CancellationToken
+        ) =
         this.EnsureReady()
         if maxNewFrames < 1 then
             invalidArg (nameof maxNewFrames) "maxNewFrames must be positive."
 
+        let streamDecodeFrames = max 1 streamDecodeFrames
         let timings = Dictionary<string, float>(StringComparer.Ordinal)
         let stopwatch = Stopwatch.StartNew()
+        cancellationToken.ThrowIfCancellationRequested()
         let prefill = runGeneratePrefill prepared
         timings["prefillMs"] <- stopwatch.Elapsed.TotalMilliseconds
 
         let frames = ResizeArray<int64>(maxNewFrames * audioNumCodebooks)
         let stepKinds = ResizeArray<string>()
+        let mutable emittedFrameStart = 0
+        let mutable emittedSampleStart = 0
+        let mutable chunkIndex = 0
+        let mutable decodeMs = 0.0
         let mutable state = prefill.State
         let mutable stateIsLive = true
         let disposeCurrentState () =
             if stateIsLive then
                 stateIsLive <- false
                 (state :> IDisposable).Dispose()
+
+        let emitFrame stepKind (frame: DenseTensor<int64>) =
+            onFrame
+                { FrameIndex = frameCount frames - 1
+                  StepKind = stepKind
+                  IsEos = frameIsEos frame
+                  Codes = frameToArray frame }
+
+        let emitDecodedChunk force =
+            cancellationToken.ThrowIfCancellationRequested()
+            let currentFrameCount = frameCount frames
+            if currentFrameCount > 0 && (force || currentFrameCount - emittedFrameStart >= streamDecodeFrames) then
+                let codes = framesToCodecTensor frames
+                let decodeWatch = Stopwatch.StartNew()
+                let audio, audioOwner = runCodecDecode codes
+                decodeWatch.Stop()
+                decodeMs <- decodeMs + decodeWatch.Elapsed.TotalMilliseconds
+                try
+                    let samples = audioSamplesFrom emittedSampleStart audio
+                    if samples.Length > 0 then
+                        onAudioChunk
+                            { ChunkIndex = chunkIndex
+                              StartFrame = emittedFrameStart
+                              FrameCount = currentFrameCount - emittedFrameStart
+                              StartSample = emittedSampleStart
+                              SampleRate = 24000
+                              Samples = samples }
+                        chunkIndex <- chunkIndex + 1
+                        emittedSampleStart <- emittedSampleStart + samples.Length
+                    emittedFrameStart <- currentFrameCount
+                finally
+                    audioOwner.Dispose()
 
         try
             let mutable current =
@@ -1065,11 +1136,14 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
 
             appendFrame frames current
             stepKinds.Add("prefill")
+            emitFrame "prefill" current
+            emitDecodedChunk false
             let mutable currentInput = frameToInputIds current
             let mutable stopReason = if frameIsEos current then "eos" else "max_frames"
             let mutable useThinker = false
 
             while frameCount frames < maxNewFrames && stopReason <> "eos" do
+                cancellationToken.ThrowIfCancellationRequested()
                 let mutable stepKind = "frame"
                 let step =
                     if useThinker && tensorContainsInt64 0L state.ThinkerEos then
@@ -1092,6 +1166,8 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
                 if frameHasAnyNonZero current then
                     appendFrame frames current
                     stepKinds.Add(stepKind)
+                    emitFrame stepKind current
+                    emitDecodedChunk false
                 currentInput <- frameToInputIds current
                 if frameIsEos current then
                     stopReason <- "eos"
@@ -1099,18 +1175,37 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
             timings["generateMs"] <- stopwatch.Elapsed.TotalMilliseconds - timings["prefillMs"]
             let codes = framesToCodecTensor frames
             disposeCurrentState ()
+            cancellationToken.ThrowIfCancellationRequested()
             let decodeWatch = Stopwatch.StartNew()
             let audio, audioOwner = runCodecDecode codes
-            timings["decodeMs"] <- decodeWatch.Elapsed.TotalMilliseconds
-            timings["totalMs"] <- stopwatch.Elapsed.TotalMilliseconds
+            decodeWatch.Stop()
+            try
+                decodeMs <- decodeMs + decodeWatch.Elapsed.TotalMilliseconds
+                let finalSamples = audioSamplesFrom emittedSampleStart audio
+                if finalSamples.Length > 0 then
+                    onAudioChunk
+                        { ChunkIndex = chunkIndex
+                          StartFrame = emittedFrameStart
+                          FrameCount = frameCount frames - emittedFrameStart
+                          StartSample = emittedSampleStart
+                          SampleRate = 24000
+                          Samples = finalSamples }
+                    emittedSampleStart <- emittedSampleStart + finalSamples.Length
+                    emittedFrameStart <- frameCount frames
+                timings["decodeMs"] <- decodeMs
+                timings["totalMs"] <- stopwatch.Elapsed.TotalMilliseconds
 
-            { AudioCodes = codes
-              AudioValues = audio
-              FrameCount = frameCount frames
-              StopReason = stopReason
-              StepKinds = stepKinds.ToArray()
-              Timings = timings
-              OwnedBuffers = [| audioOwner |] }
+                { AudioCodes = codes
+                  AudioValues = audio
+                  FrameCount = frameCount frames
+                  StopReason = stopReason
+                  StepKinds = stepKinds.ToArray()
+                  Timings = timings
+                  OwnedBuffers = [| audioOwner |] }
+            with
+            | _ ->
+                audioOwner.Dispose()
+                reraise()
         with
         | _ ->
             disposeCurrentState ()

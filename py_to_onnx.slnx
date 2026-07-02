@@ -2,4 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/ChromaOnnx/ChromaOnnx.fsproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ChromaOnnx.Tests/ChromaOnnx.Tests.fsproj" />
+  </Folder>
 </Solution>

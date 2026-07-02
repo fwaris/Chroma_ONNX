@@ -309,7 +309,7 @@ dotnet run --project src\ChromaOnnx -- s2s-offline `
   --optimized-model-cache-format onnx
 ```
 
-9. Start the local browser service:
+9. Start the local ChromaS2SONNX browser service:
 
 ```powershell
 dotnet run --project src\ChromaOnnx -- s2s-serve `
@@ -321,6 +321,10 @@ dotnet run --project src\ChromaOnnx -- s2s-serve `
   --memory-mode resident-merged `
   --ort-memory-profile quality-safe `
   --thinker-active-frames 0 `
+  --stream-decode-frames 4 `
+  --max-queue-length 32 `
+  --max-prompt-audio-seconds 60 `
+  --max-turn-audio-seconds 60 `
   --optimized-model-cache-dir onnx/chroma-s2s-full-v2/ort-cache-ort-local-external `
   --optimized-model-cache-format onnx `
   --python .venv/Scripts/python.exe `
@@ -479,9 +483,9 @@ For development/debugging, you can still export separate component graphs:
   --sequence-length 8
 ```
 
-## Run the S2S Service
+## Run ChromaS2SONNX
 
-Start the local browser lab with the merged bundle:
+Start the local ChromaS2SONNX browser lab with the merged bundle:
 
 ```powershell
 dotnet run --project src\ChromaOnnx -- s2s-serve `
@@ -493,6 +497,10 @@ dotnet run --project src\ChromaOnnx -- s2s-serve `
   --memory-mode resident-merged `
   --ort-memory-profile quality-safe `
   --thinker-active-frames 0 `
+  --stream-decode-frames 4 `
+  --max-queue-length 32 `
+  --max-prompt-audio-seconds 60 `
+  --max-turn-audio-seconds 60 `
   --optimized-model-cache-dir onnx/chroma-s2s-full-v2/ort-cache-ort-local-external `
   --optimized-model-cache-format onnx `
   --python .venv/Scripts/python.exe `
@@ -514,11 +522,19 @@ The UI supports three backend choices:
 API shape:
 
 - `GET /` serves the S2S browser lab.
-- `GET /api/status` returns bundle readiness, memory mode, loaded ORT sessions, initializer counts, and thinker feature mode.
+- `GET /api/status` returns bundle readiness, memory mode, queue state, loaded ORT sessions, initializer counts, and thinker feature mode.
 - `POST /api/s2s/sessions` creates a session.
-- `GET /ws/s2s/{sessionId}` accepts audio and returns generation events.
+- `GET /ws/s2s/{sessionId}` accepts 16 kHz Float32 PCM turn chunks and returns queue, frame, and streaming audio events.
 - `GET /api/s2s/sessions/{id}/{backend}/audio.wav` returns generated WAV.
 - `GET /api/s2s/sessions/{id}/{backend}/details.json` returns run metadata.
+
+ChromaS2SONNX queues generation FIFO and runs one F#/ONNX audio-processing job at a time. Response audio streaming is available for `F#/ONNX`; the Python comparison backend remains final-result only.
+
+Important WebSocket events:
+
+- Client sends `turn.start`, binary Float32LE PCM chunks, `turn.end`, and optionally `turn.cancel`.
+- Server sends `queue.enqueued`, `queue.updated`, `queue.started`, `generation.started`, `generation.frame`, `audio.chunk`, `generation.done`, `generation.canceled`, and `error`.
+- Each `audio.chunk` JSON event is followed by one binary Float32LE 24 kHz payload.
 
 The service path expects canonical audio:
 

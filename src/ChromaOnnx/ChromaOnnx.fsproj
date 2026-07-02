@@ -8,6 +8,7 @@
 
   <ItemGroup>
     <Compile Include="ModelStructure.fs" />
+    <Compile Include="StreamingPrimitives.fs" />
     <Compile Include="SharedWeights.fs" />
     <Compile Include="TensorUtils.fs" />
     <Compile Include="Media.fs" />

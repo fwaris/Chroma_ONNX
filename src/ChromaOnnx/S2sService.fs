@@ -8,6 +8,7 @@ open System.Net.WebSockets
 open System.Text
 open System.Text.Json
 open System.Threading
+open System.Threading.Tasks
 open Microsoft.AspNetCore.Builder
 open Microsoft.AspNetCore.Hosting
 open Microsoft.AspNetCore.Http
@@ -67,54 +68,75 @@ module S2sServe =
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Chroma S2S ONNX</title>
+  <title>ChromaS2SONNX</title>
   <style>
-    body { margin: 0; font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: #18212a; }
-    header { padding: 16px 22px; border-bottom: 1px solid #d7dde3; display: flex; justify-content: space-between; gap: 16px; }
-    main { display: grid; grid-template-columns: minmax(320px, 430px) 1fr; min-height: calc(100vh - 58px); }
-    form { padding: 18px 22px; background: #f6f8fa; border-right: 1px solid #d7dde3; display: grid; gap: 14px; align-content: start; }
+    :root { color-scheme: light; --ink: #18212a; --muted: #5e6a75; --line: #d7dde3; --panel: #f5f7f9; --accent: #0f766e; --danger: #b42318; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink); background: white; }
+    header { min-height: 58px; padding: 14px 22px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    main { display: grid; grid-template-columns: minmax(330px, 450px) 1fr; min-height: calc(100vh - 58px); }
+    form { padding: 18px 22px; background: var(--panel); border-right: 1px solid var(--line); display: grid; gap: 13px; align-content: start; }
     label { display: grid; gap: 6px; font-weight: 650; }
-    input, textarea, button { font: inherit; }
-    textarea, input[type=file], input[type=number], select { border: 1px solid #cfd6de; border-radius: 6px; padding: 9px 10px; background: white; }
-    textarea { min-height: 100px; resize: vertical; }
-    button { border: 0; border-radius: 6px; padding: 10px 13px; background: #0f766e; color: white; font-weight: 750; cursor: pointer; }
+    input, textarea, button, select { font: inherit; }
+    textarea, input[type=file], input[type=number], select { width: 100%; border: 1px solid #cbd4dd; border-radius: 6px; padding: 9px 10px; background: white; }
+    textarea { min-height: 86px; resize: vertical; }
+    button { border: 0; border-radius: 6px; padding: 10px 13px; background: var(--accent); color: white; font-weight: 750; cursor: pointer; }
     button:disabled { opacity: .6; cursor: wait; }
+    button.secondary { background: #344054; }
+    button.danger { background: var(--danger); }
+    .actions { display: grid; grid-template-columns: 1fr auto; gap: 10px; }
     section { padding: 18px 24px; display: grid; gap: 14px; align-content: start; }
-    .status { border: 1px solid #d7dde3; border-radius: 8px; padding: 12px; color: #5e6a75; }
-    .bad { color: #b42318; }
-    pre { margin: 0; max-height: 54vh; overflow: auto; background: #101923; color: #e6edf3; border-radius: 6px; padding: 12px; font-size: 12px; }
+    .status { border: 1px solid var(--line); border-radius: 8px; padding: 12px; color: var(--muted); background: white; }
+    .bad { color: var(--danger); }
+    .metrics { display: grid; grid-template-columns: repeat(3, minmax(130px, 1fr)); gap: 10px; }
+    .metric { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: white; }
+    .metric span { display: block; color: var(--muted); font-size: 12px; }
+    .metric strong { display: block; margin-top: 2px; font-size: 18px; }
+    pre { margin: 0; max-height: 46vh; overflow: auto; background: #101923; color: #e6edf3; border-radius: 6px; padding: 12px; font-size: 12px; }
     audio { width: min(720px, 100%); }
     .audioResults { display: grid; gap: 12px; }
-    .audioResult { display: grid; gap: 6px; }
+    .audioResult { display: grid; gap: 6px; border-top: 1px solid var(--line); padding-top: 12px; }
     .audioResult strong { font-size: 13px; color: #52606d; }
     .timing { font-size: 13px; color: #52606d; }
-    @media (max-width: 780px) { main { grid-template-columns: 1fr; } form { border-right: 0; border-bottom: 1px solid #d7dde3; } }
+    [hidden] { display: none !important; }
+    @media (max-width: 840px) { main { grid-template-columns: 1fr; } form { border-right: 0; border-bottom: 1px solid var(--line); } .metrics { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
   <header>
-    <strong>Chroma S2S ONNX</strong>
+    <strong>ChromaS2SONNX</strong>
     <span id="runtime">Checking runtime...</span>
   </header>
   <main>
     <form id="sessionForm">
       <label>System prompt<textarea id="systemPrompt">You are a helpful assistant.</textarea></label>
-      <label>Voice prompt text<textarea id="promptText" required>War and bloodshed throughout the world.</textarea></label>
-      <label>Voice prompt audio, 24 kHz target<input id="promptPcm" type="file" accept="audio/*,.f32" required></label>
-      <label>User turn audio, 16 kHz target<input id="turnPcm" type="file" accept="audio/*,.f32" required></label>
+      <label>Reference text<textarea id="promptText" required>War and bloodshed throughout the world.</textarea></label>
+      <label>Reference audio<input id="promptPcm" type="file" accept="audio/*,.f32" required></label>
+      <label>Turn source<select id="inputMode">
+        <option value="file" selected>Audio file</option>
+        <option value="mic">Microphone</option>
+      </select></label>
+      <label id="turnFileLabel">Turn audio<input id="turnPcm" type="file" accept="audio/*,.f32"></label>
+      <label id="micSecondsLabel" hidden>Mic seconds<input id="micSeconds" type="number" min="1" max="60" value="6"></label>
       <label>Backend<select id="backend">
         <option value="fsharp_onnx" selected>F#/ONNX</option>
         <option value="python">Python Chroma</option>
         <option value="both">Both</option>
       </select></label>
       <label>Max frames<input id="maxNewFrames" type="number" min="1" max="100" value="25"></label>
-      <button id="sendButton" type="submit">Create Session And Send Turn</button>
-      <div class="status">F#/ONNX is the default path. Python Chroma is available only when selected and uses the same configured thinker window for comparison.</div>
+      <div class="actions">
+        <button id="sendButton" type="submit">Send</button>
+        <button id="cancelButton" class="danger" type="button" disabled>Cancel</button>
+      </div>
     </form>
     <section>
       <div id="message" class="status">Idle</div>
+      <div class="metrics">
+        <div class="metric"><span>Queue</span><strong id="queueMetric">0</strong></div>
+        <div class="metric"><span>Frames</span><strong id="frameMetric">0</strong></div>
+        <div class="metric"><span>Streamed</span><strong id="streamMetric">0.00 s</strong></div>
+      </div>
       <div id="audioResults" class="audioResults"></div>
-      <audio id="audio" controls hidden></audio>
       <pre id="details">{}</pre>
     </section>
   </main>
@@ -122,17 +144,30 @@ module S2sServe =
     const runtime = document.getElementById('runtime');
     const form = document.getElementById('sessionForm');
     const button = document.getElementById('sendButton');
+    const cancelButton = document.getElementById('cancelButton');
     const message = document.getElementById('message');
     const details = document.getElementById('details');
-    const audio = document.getElementById('audio');
     const audioResults = document.getElementById('audioResults');
+    const inputMode = document.getElementById('inputMode');
+    const turnFileLabel = document.getElementById('turnFileLabel');
+    const micSecondsLabel = document.getElementById('micSecondsLabel');
+    const queueMetric = document.getElementById('queueMetric');
+    const frameMetric = document.getElementById('frameMetric');
+    const streamMetric = document.getElementById('streamMetric');
 
     let audioContext = null;
+    let playbackContext = null;
+    let playbackCursor = 0;
     let currentSocket = null;
+    let activeMicStop = null;
+    let pendingChunk = null;
+    let streamedSamples = 0;
+    let latestFrame = 0;
 
     function setBusy(isBusy) {
       button.disabled = isBusy;
-      button.textContent = isBusy ? 'Generating...' : 'Create Session And Send Turn';
+      cancelButton.disabled = !isBusy;
+      button.textContent = isBusy ? 'Running' : 'Send';
       button.setAttribute('aria-busy', isBusy ? 'true' : 'false');
     }
 
@@ -157,24 +192,18 @@ module S2sServe =
     }
 
     function renderBackendResults(results) {
-      audio.hidden = true;
-      audio.removeAttribute('src');
       audioResults.innerHTML = '';
       for (const result of results) {
         const block = document.createElement('div');
         block.className = 'audioResult';
-
         const label = document.createElement('strong');
         label.textContent = result.label || result.backend || 'Result';
-
         const timing = document.createElement('div');
         timing.className = 'timing';
         timing.textContent = timingText(result);
-
         const player = document.createElement('audio');
         player.controls = true;
         player.src = cacheBust(result.audioUrl);
-
         const links = document.createElement('div');
         if (result.audioUrl) {
           const download = document.createElement('a');
@@ -190,7 +219,6 @@ module S2sServe =
           detailLink.textContent = 'Details';
           links.append(detailLink);
         }
-
         block.append(label);
         if (timing.textContent) block.append(timing);
         block.append(player, links);
@@ -198,9 +226,10 @@ module S2sServe =
       }
     }
 
-    async function readFileBytes(input) {
-      if (!input.files.length) throw new Error(`${input.id} is required`);
-      return new Uint8Array(await input.files[0].arrayBuffer());
+    async function ensureAudioContext() {
+      audioContext = audioContext || new (window.AudioContext || window.webkitAudioContext)();
+      if (audioContext.state === 'suspended') await audioContext.resume();
+      return audioContext;
     }
 
     function asByteView(samples) {
@@ -234,17 +263,107 @@ module S2sServe =
       return output;
     }
 
+    async function readFileBytes(input) {
+      if (!input.files.length) throw new Error(`${input.id} is required`);
+      return new Uint8Array(await input.files[0].arrayBuffer());
+    }
+
     async function readAudioAsF32Bytes(input, targetRate) {
       if (!input.files.length) throw new Error(`${input.id} is required`);
       const file = input.files[0];
       if (/\.f32$/i.test(file.name)) return readFileBytes(input);
-
-      audioContext = audioContext || new (window.AudioContext || window.webkitAudioContext)();
+      const ctx = await ensureAudioContext();
       const fileBytes = await file.arrayBuffer();
-      const audioBuffer = await audioContext.decodeAudioData(fileBytes.slice(0));
+      const audioBuffer = await ctx.decodeAudioData(fileBytes.slice(0));
       const mono = mixToMono(audioBuffer);
       const resampled = resampleLinear(mono, audioBuffer.sampleRate, targetRate);
       return asByteView(resampled);
+    }
+
+    async function sendBytesInChunks(ws, bytes, chunkBytes = 32768) {
+      for (let offset = 0; offset < bytes.length; offset += chunkBytes) {
+        if (ws.readyState !== WebSocket.OPEN) throw new Error('WebSocket closed while sending audio.');
+        ws.send(bytes.slice(offset, Math.min(offset + chunkBytes, bytes.length)));
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+    }
+
+    async function playFloat32Chunk(samples, sampleRate) {
+      playbackContext = playbackContext || new (window.AudioContext || window.webkitAudioContext)();
+      if (playbackContext.state === 'suspended') await playbackContext.resume();
+      const buffer = playbackContext.createBuffer(1, samples.length, sampleRate);
+      buffer.copyToChannel(samples, 0);
+      const source = playbackContext.createBufferSource();
+      source.buffer = buffer;
+      source.connect(playbackContext.destination);
+      const now = playbackContext.currentTime;
+      if (playbackCursor < now + 0.04) playbackCursor = now + 0.04;
+      source.start(playbackCursor);
+      playbackCursor += buffer.duration;
+    }
+
+    async function handleBinaryChunk(arrayBuffer) {
+      const chunk = pendingChunk;
+      pendingChunk = null;
+      if (!chunk) return;
+      const samples = new Float32Array(arrayBuffer);
+      streamedSamples += samples.length;
+      streamMetric.textContent = `${(streamedSamples / (chunk.sampleRate || 24000)).toFixed(2)} s`;
+      await playFloat32Chunk(samples, chunk.sampleRate || 24000);
+    }
+
+    function resetRunUi() {
+      audioResults.innerHTML = '';
+      details.textContent = '{}';
+      queueMetric.textContent = '0';
+      frameMetric.textContent = '0';
+      streamMetric.textContent = '0.00 s';
+      pendingChunk = null;
+      streamedSamples = 0;
+      latestFrame = 0;
+      playbackCursor = 0;
+    }
+
+    function updateMode() {
+      const mic = inputMode.value === 'mic';
+      turnFileLabel.hidden = mic;
+      micSecondsLabel.hidden = !mic;
+    }
+
+    async function streamMicrophone(ws, seconds) {
+      const media = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }, video: false });
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const source = ctx.createMediaStreamSource(media);
+      const processor = ctx.createScriptProcessor(4096, 1, 1);
+      const silent = ctx.createGain();
+      silent.gain.value = 0;
+      let finished = false;
+      let timeoutId = 0;
+      const stop = () => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeoutId);
+        processor.disconnect();
+        source.disconnect();
+        silent.disconnect();
+        media.getTracks().forEach(track => track.stop());
+        ctx.close().catch(() => {});
+        activeMicStop = null;
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'turn.end' }));
+      };
+      activeMicStop = stop;
+      processor.onaudioprocess = event => {
+        if (finished || ws.readyState !== WebSocket.OPEN) return;
+        const input = event.inputBuffer.getChannelData(0);
+        const copy = new Float32Array(input.length);
+        copy.set(input);
+        const resampled = resampleLinear(copy, ctx.sampleRate, 16000);
+        ws.send(asByteView(resampled));
+      };
+      source.connect(processor);
+      processor.connect(silent);
+      silent.connect(ctx.destination);
+      timeoutId = setTimeout(stop, Math.max(1, seconds) * 1000);
     }
 
     async function refreshStatus() {
@@ -252,28 +371,114 @@ module S2sServe =
       const payload = await response.json();
       runtime.textContent = payload.ready ? `Ready: ${payload.executionProvider}` : 'Not ready';
       runtime.className = payload.ready ? '' : 'bad';
+      queueMetric.textContent = String(payload.queueLength || 0);
       details.textContent = JSON.stringify(payload, null, 2);
+    }
+
+    function describeEvent(payload) {
+      switch (payload.type) {
+        case 'queue.enqueued':
+        case 'queue.updated':
+          if (payload.isRunning) return 'Running';
+          return `Queued ${payload.position || 0}/${payload.queueLength || 0}`;
+        case 'queue.started':
+          return 'Queue started';
+        case 'generation.started':
+          return 'Generating';
+        case 'generation.frame':
+          latestFrame = Math.max(latestFrame, (payload.frameIndex || 0) + 1);
+          frameMetric.textContent = String(latestFrame);
+          return `Frame ${latestFrame}`;
+        case 'audio.chunk':
+          return `Streaming chunk ${(payload.chunkIndex || 0) + 1}`;
+        case 'generation.done':
+          return 'Done';
+        case 'generation.canceled':
+          return 'Canceled';
+        case 'turn.chunk':
+          return `Sent ${(payload.totalBytes / 1024).toFixed(1)} KiB`;
+        default:
+          return payload.type || 'Event';
+      }
+    }
+
+    async function startSocket(session, turnBytes, mode) {
+      const ws = new WebSocket(`${location.origin.replace('http', 'ws')}/ws/s2s/${session.id}`);
+      currentSocket = ws;
+      ws.binaryType = 'arraybuffer';
+      let generationStartedAt = 0;
+      ws.onmessage = event => {
+        if (typeof event.data !== 'string') {
+          handleBinaryChunk(event.data).catch(error => {
+            message.textContent = error.message;
+            message.className = 'status bad';
+          });
+          return;
+        }
+        const payload = JSON.parse(event.data);
+        details.textContent = JSON.stringify(payload, null, 2);
+        if (Number.isFinite(payload.queueLength)) queueMetric.textContent = String(payload.queueLength);
+        if (payload.type === 'generation.started') generationStartedAt = performance.now();
+        if (payload.type === 'audio.chunk') pendingChunk = payload;
+        if (payload.type === 'generation.done' && Array.isArray(payload.results)) renderBackendResults(payload.results);
+        if (payload.type === 'error') {
+          message.textContent = payload.message;
+          message.className = 'status bad';
+          setBusy(false);
+          if (ws.readyState === WebSocket.OPEN) ws.close(1000, 'error handled');
+          return;
+        }
+        if (payload.type === 'generation.done' && generationStartedAt > 0) {
+          message.textContent = `Done in ${formatDuration(performance.now() - generationStartedAt)}`;
+        } else {
+          message.textContent = describeEvent(payload);
+        }
+        message.className = payload.type === 'generation.canceled' ? 'status bad' : 'status';
+        if (payload.type === 'generation.done' || payload.type === 'generation.canceled') {
+          setBusy(false);
+          if (ws.readyState === WebSocket.OPEN) ws.close(1000, payload.type);
+        }
+      };
+      ws.onopen = async () => {
+        try {
+          ws.send(JSON.stringify({ type: 'turn.start' }));
+          if (mode === 'mic') {
+            const seconds = Number(document.getElementById('micSeconds').value) || 6;
+            await streamMicrophone(ws, seconds);
+          } else {
+            await sendBytesInChunks(ws, turnBytes);
+            ws.send(JSON.stringify({ type: 'turn.end' }));
+          }
+        } catch (error) {
+          message.textContent = error.message;
+          message.className = 'status bad';
+          setBusy(false);
+          if (ws.readyState === WebSocket.OPEN) ws.close(1011, error.message);
+        }
+      };
+      ws.onerror = () => {
+        message.textContent = 'WebSocket error while generating.';
+        message.className = 'status bad';
+        setBusy(false);
+      };
+      ws.onclose = () => {
+        if (currentSocket === ws) currentSocket = null;
+        if (activeMicStop) activeMicStop();
+        setBusy(false);
+      };
     }
 
     form.addEventListener('submit', async event => {
       event.preventDefault();
       if (currentSocket && currentSocket.readyState === WebSocket.OPEN) currentSocket.close(1000, 'new request');
       setBusy(true);
-      audio.hidden = true;
-      audio.removeAttribute('src');
-      audioResults.innerHTML = '';
-      message.textContent = 'Creating session...';
+      resetRunUi();
+      message.textContent = 'Creating session';
       message.className = 'status';
-      let finished = false;
-      const finish = () => {
-        if (!finished) {
-          finished = true;
-          setBusy(false);
-        }
-      };
       try {
+        const mode = inputMode.value;
         const promptPcm = await readAudioAsF32Bytes(document.getElementById('promptPcm'), 24000);
-        const turnPcm = await readAudioAsF32Bytes(document.getElementById('turnPcm'), 16000);
+        const turnPcm = mode === 'file' ? await readAudioAsF32Bytes(document.getElementById('turnPcm'), 16000) : null;
         const formData = new FormData();
         formData.set('promptText', document.getElementById('promptText').value);
         formData.set('systemPrompt', document.getElementById('systemPrompt').value);
@@ -284,64 +489,26 @@ module S2sServe =
         const session = await sessionResponse.json();
         details.textContent = JSON.stringify(session, null, 2);
         if (!sessionResponse.ok) throw new Error(session.error || sessionResponse.statusText);
-
-        message.textContent = 'Sending turn...';
-        const ws = new WebSocket(`${location.origin.replace('http', 'ws')}/ws/s2s/${session.id}`);
-        currentSocket = ws;
-        ws.binaryType = 'arraybuffer';
-        let generationStartedAt = 0;
-        ws.onmessage = event => {
-          const payload = JSON.parse(event.data);
-          details.textContent = JSON.stringify(payload, null, 2);
-          if (payload.type === 'generation.started') {
-            generationStartedAt = performance.now();
-          }
-          if (payload.type === 'generation.done' && Array.isArray(payload.results)) {
-            renderBackendResults(payload.results);
-          } else if (payload.type === 'generation.done' && payload.audioUrl) {
-            audio.src = cacheBust(payload.audioUrl);
-            audio.hidden = false;
-          }
-          if (payload.type === 'error') {
-            message.textContent = payload.message;
-            message.className = 'status bad';
-            finish();
-            if (ws.readyState === WebSocket.OPEN) ws.close(1000, 'error handled');
-          } else {
-            const elapsedMs = payload.type === 'generation.done' && generationStartedAt > 0
-              ? performance.now() - generationStartedAt
-              : NaN;
-            message.textContent = payload.type === 'generation.done' && Number.isFinite(elapsedMs)
-              ? `generation.done - page end-to-end ${formatDuration(elapsedMs)}`
-              : payload.type;
-            message.className = 'status';
-            if (payload.type === 'generation.done') {
-              finish();
-              if (ws.readyState === WebSocket.OPEN) ws.close(1000, 'done');
-            }
-          }
-        };
-        ws.onopen = () => {
-          ws.send(JSON.stringify({ type: 'turn.start' }));
-          ws.send(turnPcm);
-          ws.send(JSON.stringify({ type: 'turn.end' }));
-        };
-        ws.onerror = () => {
-          message.textContent = 'WebSocket error while generating.';
-          message.className = 'status bad';
-          finish();
-        };
-        ws.onclose = () => {
-          if (currentSocket === ws) currentSocket = null;
-          finish();
-        };
+        message.textContent = mode === 'mic' ? 'Opening microphone' : 'Sending turn audio';
+        await startSocket(session, turnPcm, mode);
       } catch (error) {
         message.textContent = error.message;
         message.className = 'status bad';
-        finish();
+        setBusy(false);
       }
     });
 
+    cancelButton.addEventListener('click', () => {
+      if (activeMicStop) activeMicStop();
+      if (currentSocket && currentSocket.readyState === WebSocket.OPEN) {
+        currentSocket.send(JSON.stringify({ type: 'turn.cancel' }));
+        currentSocket.close(1000, 'canceled');
+      }
+      setBusy(false);
+    });
+
+    inputMode.addEventListener('change', updateMode);
+    updateMode();
     refreshStatus().catch(error => {
       runtime.textContent = error.message;
       runtime.className = 'bad';
@@ -394,10 +561,20 @@ module S2sServe =
         | true, value when value <> null -> string value
         | _ -> ""
 
+    let private nullableString (value: string option) : string | null =
+        match value with
+        | Some text -> text
+        | None -> null
+
     let private sendJson (socket: WebSocket) (payload: 'T) =
         task {
             let bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload, jsonOptions))
             do! socket.SendAsync(ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None)
+        }
+
+    let private sendBinary (socket: WebSocket) (payload: byte array) =
+        task {
+            do! socket.SendAsync(ArraySegment<byte>(payload), WebSocketMessageType.Binary, true, CancellationToken.None)
         }
 
     let private readFormFileBytes (form: IFormCollection) (name: string) =
@@ -434,7 +611,7 @@ module S2sServe =
             return messageType, stream.ToArray()
         }
 
-    let private createSession (processor: ChromaNativeProcessor) (store: S2sSessionStore) (ctx: HttpContext) =
+    let private createSession (processor: ChromaNativeProcessor) (maxPromptAudioSamples: int) (store: S2sSessionStore) (ctx: HttpContext) =
         task {
             if not ctx.Request.HasFormContentType then
                 do! writeJson ctx 400 (error 400 "Expected multipart/form-data.")
@@ -453,20 +630,31 @@ module S2sServe =
                         do! writeJson ctx 400 (error 400 "promptText is required.")
                     else
                         let promptAudioBytes = readFormFileBytes form "promptPcm24k"
-                        let promptAudio = processor.ReadFloat32PcmFromBytes promptAudioBytes
-                        let session = store.Create(promptText, systemPrompt, backend, promptAudio, maxNewFrames)
-                        File.WriteAllBytes(Path.Combine(session.WorkDir, "prompt_audio_24k.f32"), promptAudioBytes)
-                        let payload =
-                            {| id = session.Id
-                               mode = "s2s_greedy"
-                               backend = session.Backend
-                               promptText = session.PromptText
-                               systemPrompt = session.SystemPrompt
-                               maxNewFrames = session.MaxNewFrames
-                               promptAudioSamples = session.PromptAudio24k.Length
-                               promptSampleRate = processor.PromptSampleRate
-                               websocketUrl = $"/ws/s2s/{session.Id}" |}
-                        do! writeJson ctx 200 payload
+                        let maxPromptBytes = maxPromptAudioSamples * sizeof<float32>
+                        if promptAudioBytes.Length > maxPromptBytes then
+                            do!
+                                writeJson
+                                    ctx
+                                    413
+                                    (error
+                                        413
+                                        $"promptPcm24k is too large. The configured maximum is {maxPromptAudioSamples} Float32 samples.")
+                        else
+                            let promptAudio = processor.ReadFloat32PcmFromBytes promptAudioBytes
+                            let session = store.Create(promptText, systemPrompt, backend, promptAudio, maxNewFrames)
+                            File.WriteAllBytes(Path.Combine(session.WorkDir, "prompt_audio_24k.f32"), promptAudioBytes)
+                            let payload =
+                                {| id = session.Id
+                                   serviceName = "ChromaS2SONNX"
+                                   mode = "s2s_greedy_streaming"
+                                   backend = session.Backend
+                                   promptText = session.PromptText
+                                   systemPrompt = session.SystemPrompt
+                                   maxNewFrames = session.MaxNewFrames
+                                   promptAudioSamples = session.PromptAudio24k.Length
+                                   promptSampleRate = processor.PromptSampleRate
+                                   websocketUrl = $"/ws/s2s/{session.Id}" |}
+                            do! writeJson ctx 200 payload
                 with ex ->
                     do! writeJson ctx 400 (error 400 ex.Message)
         }
@@ -479,6 +667,10 @@ module S2sServe =
     let private runFsharpBackend
         (processor: ChromaNativeProcessor)
         (runner: ChromaS2sOnnxRunner)
+        streamDecodeFrames
+        (onFrame: S2sGeneratedFrame -> unit)
+        (onAudioChunk: S2sAudioChunk -> unit)
+        (cancellationToken: CancellationToken)
         (session: S2sSession)
         (userAudio: float32 array)
         (prepared: NativeS2sPrepared)
@@ -487,7 +679,15 @@ module S2sServe =
         let backendDir = Path.Combine(session.WorkDir, backend)
         Directory.CreateDirectory(backendDir) |> ignore
         let memoryBefore = RuntimeMemory.current()
-        use result = runner.Generate(prepared, session.MaxNewFrames)
+        use result =
+            runner.GenerateStreaming(
+                prepared,
+                session.MaxNewFrames,
+                streamDecodeFrames,
+                onFrame,
+                onAudioChunk,
+                cancellationToken
+            )
         let memoryAfter = RuntimeMemory.current()
         let codesPath = Path.Combine(backendDir, "audio_codes.i64")
         let rawAudioPath = Path.Combine(backendDir, "audio_values.f32")
@@ -616,7 +816,9 @@ module S2sServe =
         python
         pythonDevice
         pythonThinkerActiveFrames
-        (generationLock: SemaphoreSlim)
+        streamDecodeFrames
+        maxTurnAudioSamples
+        (workQueue: StreamingWorkQueue)
         (store: S2sSessionStore)
         (ctx: HttpContext)
         =
@@ -631,17 +833,76 @@ module S2sServe =
                 | None -> do! writeJson ctx 404 (error 404 "S2S session was not found.")
                 | Some session ->
                     use! socket = ctx.WebSockets.AcceptWebSocketAsync()
-                    do! sendJson socket {| ``type`` = "session.ready"; id = session.Id; maxNewFrames = session.MaxNewFrames |}
+                    use sendLock = new SemaphoreSlim(1, 1)
+                    use socketCancellation = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted)
+                    let sendJsonLocked payload =
+                        task {
+                            do! sendLock.WaitAsync()
+                            try
+                                do! sendJson socket payload
+                            finally
+                                sendLock.Release() |> ignore
+                        }
+                    let sendBinaryLocked payload =
+                        task {
+                            do! sendLock.WaitAsync()
+                            try
+                                do! sendBinary socket payload
+                            finally
+                                sendLock.Release() |> ignore
+                        }
+                    let trySendJsonLocked payload =
+                        task {
+                            try
+                                if socket.State = WebSocketState.Open then
+                                    do! sendJsonLocked payload
+                            with _ ->
+                                ()
+                        }
+                    let sendJsonBlocking payload =
+                        sendJsonLocked payload |> fun work -> work.GetAwaiter().GetResult()
+                    let sendBinaryBlocking payload =
+                        sendBinaryLocked payload |> fun work -> work.GetAwaiter().GetResult()
+                    let queueUpdate (snapshot: WorkQueuePosition) =
+                        sendJsonBlocking
+                            {| ``type`` = "queue.updated"
+                               id = session.Id
+                               requestId = snapshot.Id
+                               position = snapshot.Position
+                               queueLength = snapshot.QueueLength
+                               runningId = nullableString snapshot.RunningId
+                               isRunning = snapshot.IsRunning |}
+
+                    do!
+                        sendJsonLocked
+                            {| ``type`` = "session.ready"
+                               id = session.Id
+                               maxNewFrames = session.MaxNewFrames
+                               streamDecodeFrames = streamDecodeFrames
+                               queueLength = workQueue.QueueLength
+                               maxQueueLength = workQueue.MaxQueueLength |}
                     use turnAudio = new MemoryStream()
                     let mutable running = true
+                    let mutable queuedHandle: QueuedWorkHandle option = None
                     while running && socket.State = WebSocketState.Open do
                         let! messageType, payload = receiveMessage socket
                         match messageType with
                         | WebSocketMessageType.Close ->
+                            queuedHandle |> Option.iter (fun handle -> handle.Cancel())
+                            socketCancellation.Cancel()
                             running <- false
                         | WebSocketMessageType.Binary ->
-                            turnAudio.Write(payload, 0, payload.Length)
-                            do! sendJson socket {| ``type`` = "turn.chunk"; bytes = payload.Length; totalBytes = turnAudio.Length |}
+                            let maxTurnBytes = int64 maxTurnAudioSamples * int64 sizeof<float32>
+                            if turnAudio.Length + int64 payload.Length > maxTurnBytes then
+                                socketCancellation.Cancel()
+                                running <- false
+                                do!
+                                    sendJsonLocked
+                                        {| ``type`` = "error"
+                                           message = $"User turn audio is too large. The configured maximum is {maxTurnAudioSamples} Float32 samples." |}
+                            else
+                                turnAudio.Write(payload, 0, payload.Length)
+                                do! sendJsonLocked {| ``type`` = "turn.chunk"; bytes = payload.Length; totalBytes = turnAudio.Length |}
                         | WebSocketMessageType.Text ->
                             let text = Encoding.UTF8.GetString(payload)
                             use doc = JsonDocument.Parse(text)
@@ -653,71 +914,163 @@ module S2sServe =
                             match eventType with
                             | "turn.start" ->
                                 turnAudio.SetLength(0L)
-                                do! sendJson socket {| ``type`` = "turn.accepted"; id = session.Id |}
+                                do! sendJsonLocked {| ``type`` = "turn.accepted"; id = session.Id |}
+                            | "turn.cancel" ->
+                                queuedHandle |> Option.iter (fun handle -> handle.Cancel())
+                                socketCancellation.Cancel()
+                                running <- false
+                                do! trySendJsonLocked {| ``type`` = "generation.canceled"; id = session.Id |}
                             | "turn.end" ->
                                 try
                                     let turnAudioBytes = turnAudio.ToArray()
-                                    let userAudio = processor.ReadFloat32PcmFromBytes(turnAudioBytes)
-                                    let requestedBackends =
-                                        match session.Backend with
-                                        | "both" -> [| "fsharp_onnx"; "python" |]
-                                        | backend -> [| backend |]
-                                    File.WriteAllBytes(Path.Combine(session.WorkDir, "user_audio_16k.f32"), turnAudioBytes)
-                                    do! sendJson socket {| ``type`` = "generation.started"; id = session.Id; backend = session.Backend; backends = requestedBackends; maxNewFrames = session.MaxNewFrames |}
-                                    do! generationLock.WaitAsync()
-                                    let results = ResizeArray<JsonElement>()
-                                    try
-                                        if requestedBackends |> Array.contains "fsharp_onnx" then
-                                            use prepared = processor.Prepare(session.PromptText, session.SystemPrompt, session.PromptAudio24k, userAudio)
-                                            File.WriteAllText(Path.Combine(session.WorkDir, "conversation.txt"), prepared.ConversationText)
-                                            results.Add(runFsharpBackend processor runner session userAudio prepared)
+                                    if turnAudioBytes.Length = 0 then
+                                        do! sendJsonLocked {| ``type`` = "error"; message = "User turn audio is required before turn.end." |}
+                                    else
+                                        let requestId = $"{session.Id}_{Guid.NewGuid():N}"
+                                        let work (jobCancellationToken: CancellationToken) : Task =
+                                            task {
+                                                jobCancellationToken.ThrowIfCancellationRequested()
+                                                do!
+                                                    sendJsonLocked
+                                                        {| ``type`` = "queue.started"
+                                                           id = session.Id
+                                                           requestId = requestId
+                                                           queueLength = workQueue.QueueLength |}
+                                                let userAudio = processor.ReadFloat32PcmFromBytes(turnAudioBytes)
+                                                let requestedBackends =
+                                                    match session.Backend with
+                                                    | "both" -> [| "fsharp_onnx"; "python" |]
+                                                    | backend -> [| backend |]
+                                                File.WriteAllBytes(Path.Combine(session.WorkDir, "user_audio_16k.f32"), turnAudioBytes)
+                                                do!
+                                                    sendJsonLocked
+                                                        {| ``type`` = "generation.started"
+                                                           id = session.Id
+                                                           requestId = requestId
+                                                           backend = session.Backend
+                                                           backends = requestedBackends
+                                                           maxNewFrames = session.MaxNewFrames
+                                                           streamDecodeFrames = streamDecodeFrames |}
+                                                let results = ResizeArray<JsonElement>()
 
-                                        if requestedBackends |> Array.contains "python" then
-                                            let! pythonResult =
-                                                runPythonBackend
-                                                    modelDir
-                                                    python
-                                                    pythonDevice
-                                                    pythonThinkerActiveFrames
-                                                    processor
-                                                    session
-                                                    (Path.Combine(session.WorkDir, "user_audio_16k.f32"))
-                                            results.Add(pythonResult)
-                                    finally
-                                        generationLock.Release() |> ignore
+                                                if requestedBackends |> Array.contains "fsharp_onnx" then
+                                                    use prepared = processor.Prepare(session.PromptText, session.SystemPrompt, session.PromptAudio24k, userAudio)
+                                                    File.WriteAllText(Path.Combine(session.WorkDir, "conversation.txt"), prepared.ConversationText)
+                                                    let onFrame (frame: S2sGeneratedFrame) =
+                                                        sendJsonBlocking
+                                                            {| ``type`` = "generation.frame"
+                                                               id = session.Id
+                                                               requestId = requestId
+                                                               frameIndex = frame.FrameIndex
+                                                               stepKind = frame.StepKind
+                                                               isEos = frame.IsEos
+                                                               codes = frame.Codes |}
+                                                    let onAudioChunk (chunk: S2sAudioChunk) =
+                                                        let bytes = AudioChunk.float32ToLittleEndianBytes chunk.Samples
+                                                        sendJsonBlocking
+                                                            {| ``type`` = "audio.chunk"
+                                                               id = session.Id
+                                                               requestId = requestId
+                                                               chunkIndex = chunk.ChunkIndex
+                                                               startFrame = chunk.StartFrame
+                                                               frameCount = chunk.FrameCount
+                                                               startSample = chunk.StartSample
+                                                               sampleRate = chunk.SampleRate
+                                                               sampleCount = chunk.Samples.Length
+                                                               byteLength = bytes.Length
+                                                               format = "f32le" |}
+                                                        sendBinaryBlocking bytes
+                                                    results.Add(
+                                                        runFsharpBackend
+                                                            processor
+                                                            runner
+                                                            streamDecodeFrames
+                                                            onFrame
+                                                            onAudioChunk
+                                                            jobCancellationToken
+                                                            session
+                                                            userAudio
+                                                            prepared
+                                                    )
 
-                                    let firstResult = results[0]
-                                    let firstBackend = firstResult.GetProperty("backend").GetString() |> Option.ofObj |> Option.defaultValue "fsharp_onnx"
-                                    let firstAudioUrl = firstResult.GetProperty("audioUrl").GetString() |> Option.ofObj |> Option.defaultValue ""
-                                    let firstDetailsUrl = firstResult.GetProperty("detailsUrl").GetString() |> Option.ofObj |> Option.defaultValue ""
-                                    let firstBackendDir = Path.Combine(session.WorkDir, firstBackend)
-                                    let firstAudioPath = Path.Combine(firstBackendDir, "audio.wav")
-                                    if File.Exists firstAudioPath then
-                                        File.Copy(firstAudioPath, Path.Combine(session.WorkDir, "audio.wav"), true)
-                                    let details =
-                                        {| id = session.Id
-                                           mode = "s2s_greedy_compare"
-                                           backend = session.Backend
-                                           maxNewFrames = session.MaxNewFrames
-                                           pythonInRequestPath = requestedBackends |> Array.contains "python"
-                                           results = results.ToArray() |}
-                                    let detailsJson = JsonSerializer.Serialize(details, jsonOptions)
-                                    File.WriteAllText(Path.Combine(session.WorkDir, "details.json"), detailsJson)
-                                    do!
-                                        sendJson
-                                            socket
-                                            {| ``type`` = "generation.done"
-                                               id = session.Id
-                                               backend = session.Backend
-                                               audioUrl = firstAudioUrl
-                                               detailsUrl = firstDetailsUrl
-                                               results = results.ToArray() |}
+                                                if requestedBackends |> Array.contains "python" then
+                                                    jobCancellationToken.ThrowIfCancellationRequested()
+                                                    let! pythonResult =
+                                                        runPythonBackend
+                                                            modelDir
+                                                            python
+                                                            pythonDevice
+                                                            pythonThinkerActiveFrames
+                                                            processor
+                                                            session
+                                                            (Path.Combine(session.WorkDir, "user_audio_16k.f32"))
+                                                    results.Add(pythonResult)
+
+                                                let firstResult = results[0]
+                                                let firstBackend = firstResult.GetProperty("backend").GetString() |> Option.ofObj |> Option.defaultValue "fsharp_onnx"
+                                                let firstAudioUrl = firstResult.GetProperty("audioUrl").GetString() |> Option.ofObj |> Option.defaultValue ""
+                                                let firstDetailsUrl = firstResult.GetProperty("detailsUrl").GetString() |> Option.ofObj |> Option.defaultValue ""
+                                                let firstBackendDir = Path.Combine(session.WorkDir, firstBackend)
+                                                let firstAudioPath = Path.Combine(firstBackendDir, "audio.wav")
+                                                if File.Exists firstAudioPath then
+                                                    File.Copy(firstAudioPath, Path.Combine(session.WorkDir, "audio.wav"), true)
+                                                let details =
+                                                    {| id = session.Id
+                                                       requestId = requestId
+                                                       mode = "s2s_greedy_streaming"
+                                                       backend = session.Backend
+                                                       maxNewFrames = session.MaxNewFrames
+                                                       streamDecodeFrames = streamDecodeFrames
+                                                       pythonInRequestPath = requestedBackends |> Array.contains "python"
+                                                       results = results.ToArray() |}
+                                                let detailsJson = JsonSerializer.Serialize(details, jsonOptions)
+                                                File.WriteAllText(Path.Combine(session.WorkDir, "details.json"), detailsJson)
+                                                do!
+                                                    sendJsonLocked
+                                                        {| ``type`` = "generation.done"
+                                                           id = session.Id
+                                                           requestId = requestId
+                                                           backend = session.Backend
+                                                           audioUrl = firstAudioUrl
+                                                           detailsUrl = firstDetailsUrl
+                                                           results = results.ToArray() |}
+                                            }
+                                            :> Task
+
+                                        match workQueue.TryEnqueue(requestId, work, queueUpdate, socketCancellation.Token) with
+                                        | QueueFull maxQueueLength ->
+                                            do!
+                                                sendJsonLocked
+                                                    {| ``type`` = "error"
+                                                       message = $"Generation queue is full. Try again after a current request finishes."
+                                                       maxQueueLength = maxQueueLength |}
+                                        | Enqueued(handle, snapshot) ->
+                                            queuedHandle <- Some handle
+                                            do!
+                                                sendJsonLocked
+                                                    {| ``type`` = "queue.enqueued"
+                                                       id = session.Id
+                                                       requestId = requestId
+                                                       position = snapshot.Position
+                                                       queueLength = snapshot.QueueLength
+                                                       runningId = nullableString snapshot.RunningId
+                                                       maxQueueLength = workQueue.MaxQueueLength |}
+                                            try
+                                                do! handle.Completion
+                                                running <- false
+                                            with
+                                            | :? OperationCanceledException ->
+                                                running <- false
+                                                do! trySendJsonLocked {| ``type`` = "generation.canceled"; id = session.Id; requestId = requestId |}
+                                            | ex ->
+                                                running <- false
+                                                do! trySendJsonLocked {| ``type`` = "error"; message = ex.Message; bundle = runner.Status |}
                                 with ex ->
-                                    do! sendJson socket {| ``type`` = "error"; message = ex.Message; bundle = runner.Status |}
+                                    do! sendJsonLocked {| ``type`` = "error"; message = ex.Message; bundle = runner.Status |}
                             | _ ->
-                                do! sendJson socket {| ``type`` = "error"; message = $"Unknown WebSocket event '{eventType}'." |}
+                                do! sendJsonLocked {| ``type`` = "error"; message = $"Unknown WebSocket event '{eventType}'." |}
                         | _ ->
-                            do! sendJson socket {| ``type`` = "error"; message = $"Unsupported WebSocket message type {messageType}." |}
+                            do! sendJsonLocked {| ``type`` = "error"; message = $"Unsupported WebSocket message type {messageType}." |}
 
                     if socket.State = WebSocketState.Open || socket.State = WebSocketState.CloseReceived then
                         do! socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "done", CancellationToken.None)
@@ -774,6 +1127,14 @@ module S2sServe =
         let thinkerActiveFrames = int thinkerActiveFramesArg
         let python = optional ".venv\\Scripts\\python.exe" "--python" args
         let pythonDevice = optional (if executionProvider.Equals("cuda", StringComparison.OrdinalIgnoreCase) then "cuda" else "cpu") "--python-device" args
+        let streamDecodeFrames = optional "4" "--stream-decode-frames" args |> int |> max 1
+        let maxQueueLength = optional "32" "--max-queue-length" args |> int |> max 0
+        let maxPromptAudioSeconds =
+            optional "60" "--max-prompt-audio-seconds" args
+            |> fun value -> Math.Max(0.1, Double.Parse(value, CultureInfo.InvariantCulture))
+        let maxTurnAudioSeconds =
+            optional "60" "--max-turn-audio-seconds" args
+            |> fun value -> Math.Max(0.1, Double.Parse(value, CultureInfo.InvariantCulture))
 
         Directory.CreateDirectory(workDir) |> ignore
         let tuningOptions =
@@ -783,7 +1144,9 @@ module S2sServe =
         use runner = new ChromaS2sOnnxRunner(modelDir, bundleDir, executionProvider, memoryMode, tuningOptions)
         let processor = ChromaNativeProcessor(modelDir, thinkerActiveFrames)
         let store = S2sSessionStore(workDir)
-        use generationLock = new SemaphoreSlim(1, 1)
+        let workQueue = StreamingWorkQueue(maxQueueLength)
+        let maxPromptAudioSamples = int (Math.Ceiling(maxPromptAudioSeconds * float processor.PromptSampleRate))
+        let maxTurnAudioSamples = int (Math.Ceiling(maxTurnAudioSeconds * float processor.ThinkerSampleRate))
 
         let builder = WebApplication.CreateBuilder(Array.empty<string>)
         builder.WebHost.UseUrls($"http://localhost:{port}") |> ignore
@@ -798,7 +1161,8 @@ module S2sServe =
                     let status = runner.Status
                     let payload =
                         {| ready = status.Ready
-                           mode = "s2s_greedy"
+                           serviceName = "ChromaS2SONNX"
+                           mode = "s2s_greedy_streaming"
                            pythonInRequestPath = false
                            pythonBackendAvailable = File.Exists python
                            python = python
@@ -815,6 +1179,12 @@ module S2sServe =
                            loadedOrtSessions = runner.LoadedSessionNames
                            warmOrtSessions = runner.WarmSessionNames
                            activePagedOrtSessions = runner.ActivePagedSessionNames
+                           queueLength = workQueue.QueueLength
+                           runningRequestId = nullableString workQueue.RunningId
+                           maxQueueLength = workQueue.MaxQueueLength
+                           streamDecodeFrames = streamDecodeFrames
+                           maxPromptAudioSeconds = maxPromptAudioSeconds
+                           maxTurnAudioSeconds = maxTurnAudioSeconds
                            peakPrivateGb = runner.PeakPrivateGb
                            peakWorkingSetGb = runner.PeakWorkingSetGb
                            mappedSafetensorShards = runner.MappedShardCount
@@ -834,18 +1204,20 @@ module S2sServe =
                     do! writeJson ctx 200 payload
                 })
         ) |> ignore
-        app.MapPost("/api/s2s/sessions", RequestDelegate(fun ctx -> createSession processor store ctx)) |> ignore
-        app.MapGet("/ws/s2s/{id}", RequestDelegate(fun ctx -> handleSocket processor runner modelDir python pythonDevice thinkerActiveFramesArg generationLock store ctx)) |> ignore
+        app.MapPost("/api/s2s/sessions", RequestDelegate(fun ctx -> createSession processor maxPromptAudioSamples store ctx)) |> ignore
+        app.MapGet("/ws/s2s/{id}", RequestDelegate(fun ctx -> handleSocket processor runner modelDir python pythonDevice thinkerActiveFramesArg streamDecodeFrames maxTurnAudioSamples workQueue store ctx)) |> ignore
         app.MapGet("/api/s2s/sessions/{id}/details.json", RequestDelegate(fun ctx -> serveSessionFile store "details.json" "application/json; charset=utf-8" ctx)) |> ignore
         app.MapGet("/api/s2s/sessions/{id}/audio.wav", RequestDelegate(fun ctx -> serveSessionFile store "audio.wav" "audio/wav" ctx)) |> ignore
         app.MapGet("/api/s2s/sessions/{id}/{backend}/details.json", RequestDelegate(fun ctx -> serveBackendSessionFile store "details.json" "application/json; charset=utf-8" ctx)) |> ignore
         app.MapGet("/api/s2s/sessions/{id}/{backend}/audio.wav", RequestDelegate(fun ctx -> serveBackendSessionFile store "audio.wav" "audio/wav" ctx)) |> ignore
 
-        printfn "Chroma S2S ONNX service listening on http://localhost:%d" port
+        printfn "ChromaS2SONNX service listening on http://localhost:%d" port
         printfn "Python in request path: selectable"
         printfn "Python backend: %s (%s)" python pythonDevice
         printfn "Memory mode: %s" runner.MemoryMode
         printfn "ORT memory profile: %s" runner.OrtMemoryProfile
+        printfn "Stream decode frames: %d" streamDecodeFrames
+        printfn "Max queue length: %d" workQueue.MaxQueueLength
         printfn "Thinker features: %s" processor.ThinkerFeatureMode
         if runner.OptimizedModelCacheEnabled then
             printfn "Optimized model cache: %s (%s)" runner.OptimizedModelCacheDir runner.OptimizedModelCacheFormat

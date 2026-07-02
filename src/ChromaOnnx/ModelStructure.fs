@@ -187,6 +187,20 @@ type S2sGenerationResult =
             for buffer in this.OwnedBuffers do
                 buffer.Dispose()
 
+type S2sGeneratedFrame =
+    { FrameIndex: int
+      StepKind: string
+      IsEos: bool
+      Codes: int64 array }
+
+type S2sAudioChunk =
+    { ChunkIndex: int
+      StartFrame: int
+      FrameCount: int
+      StartSample: int
+      SampleRate: int
+      Samples: float32 array }
+
 type DebugTensorInfo =
     { File: string
       Dtype: string

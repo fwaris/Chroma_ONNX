@@ -287,7 +287,17 @@ module SharedWeights =
         | _ -> Array.empty
 
     let private resolvePath (bundleDir: string) (path: string) =
-        if Path.IsPathRooted(path) then path else Path.GetFullPath(Path.Combine(bundleDir, path))
+        if Path.IsPathRooted(path) then
+            if File.Exists path then
+                path
+            else
+                match Path.GetFileName path with
+                | null | "" -> path
+                | fileName ->
+                    let localPath = Path.GetFullPath(Path.Combine(bundleDir, fileName))
+                    if File.Exists localPath then localPath else path
+        else
+            Path.GetFullPath(Path.Combine(bundleDir, path))
 
     let loadManifest (bundleDir: string) =
         let manifestPath = Path.Combine(bundleDir, "shared_weights_manifest.json")
