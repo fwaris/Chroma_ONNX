@@ -17,6 +17,6 @@
     <ProjectReference Include="..\ChromaOnnx.Core\ChromaOnnx.Core.fsproj" />
     <ProjectReference Include="..\ChromaOnnx.OnnxRuntime\ChromaOnnx.OnnxRuntime.fsproj" />
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
-    <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.27.0" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" />
   </ItemGroup>
 </Project>

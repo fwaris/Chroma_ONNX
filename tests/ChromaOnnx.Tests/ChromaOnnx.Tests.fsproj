@@ -14,6 +14,6 @@
     <ProjectReference Include="..\..\src\ChromaOnnx.Core\ChromaOnnx.Core.fsproj" />
     <ProjectReference Include="..\..\src\ChromaOnnx.Service\ChromaOnnx.Service.fsproj" />
     <ProjectReference Include="..\..\src\ChromaOnnx.SpeechToSpeech\ChromaOnnx.SpeechToSpeech.fsproj" />
-    <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="10.0.0" />
+    <PackageReference Include="Microsoft.AspNetCore.TestHost" />
   </ItemGroup>
 </Project>

@@ -20,10 +20,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="libtorch-cpu" Version="2.10.0.0" />
-    <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.27.0" />
-    <PackageReference Include="Tokenizers.HuggingFace" Version="2.21.4" />
-    <PackageReference Include="TorchSharp" Version="0.106.0" />
-    <PackageReference Include="TorchSharp.Fun" Version="0.91.0" />
+    <PackageReference Include="libtorch-cpu" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" />
+    <PackageReference Include="Tokenizers.HuggingFace" />
+    <PackageReference Include="TorchSharp" />
+    <PackageReference Include="TorchSharp.Fun" />
   </ItemGroup>
 </Project>
