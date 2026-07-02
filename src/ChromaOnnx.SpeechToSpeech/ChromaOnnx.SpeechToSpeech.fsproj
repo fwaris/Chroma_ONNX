@@ -1,22 +1,17 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="S2sService.fs" />
-    <Compile Include="OneFrameService.fs" />
-    <Compile Include="Cli.fs" />
-    <Compile Include="Program.fs" />
+    <Compile Include="RuntimeTypes.fs" />
+    <Compile Include="S2sRuntime.fs" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\ChromaOnnx.Core\ChromaOnnx.Core.fsproj" />
     <ProjectReference Include="..\ChromaOnnx.OnnxRuntime\ChromaOnnx.OnnxRuntime.fsproj" />
-    <FrameworkReference Include="Microsoft.AspNetCore.App" />
-    <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.27.0" />
   </ItemGroup>
 </Project>

@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ChromaOnnx.Core/ChromaOnnx.Core.fsproj" />
+    <Project Path="src/ChromaOnnx.OnnxRuntime/ChromaOnnx.OnnxRuntime.fsproj" />
+    <Project Path="src/ChromaOnnx.SpeechToSpeech/ChromaOnnx.SpeechToSpeech.fsproj" />
+    <Project Path="src/ChromaOnnx.Service/ChromaOnnx.Service.fsproj" />
+    <Project Path="src/ChromaOnnx/ChromaOnnx.fsproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ChromaOnnx.Tests/ChromaOnnx.Tests.fsproj" />
+  </Folder>
+</Solution>

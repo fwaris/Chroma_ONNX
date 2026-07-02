@@ -110,8 +110,8 @@ module S2sServe =
   <main>
     <form id="sessionForm">
       <label>System prompt<textarea id="systemPrompt">You are a helpful assistant.</textarea></label>
-      <label>Reference text<textarea id="promptText" required>War and bloodshed throughout the world.</textarea></label>
-      <label>Reference audio<input id="promptPcm" type="file" accept="audio/*,.f32" required></label>
+      <label>Reference text<textarea id="promptText" required>Why don't skeletons fight each other. They don't have the guts.</textarea></label>
+      <label>Reference audio<input id="promptPcm" type="file" accept="audio/*,.f32"></label>
       <label>Turn source<select id="inputMode">
         <option value="file" selected>Audio file</option>
         <option value="mic">Microphone</option>
@@ -163,6 +163,8 @@ module S2sServe =
     let pendingChunk = null;
     let streamedSamples = 0;
     let latestFrame = 0;
+    const defaultPromptTextUrl = '/assets/southern_belle_prompt.txt';
+    const defaultPromptAudioUrl = '/assets/southern_belle.mp3';
 
     function setBusy(isBusy) {
       button.disabled = isBusy;
@@ -263,21 +265,27 @@ module S2sServe =
       return output;
     }
 
-    async function readFileBytes(input) {
-      if (!input.files.length) throw new Error(`${input.id} is required`);
-      return new Uint8Array(await input.files[0].arrayBuffer());
+    async function readAudioBufferAsF32Bytes(bytes, fileName, targetRate) {
+      if (/\.f32$/i.test(fileName)) return new Uint8Array(bytes);
+      const ctx = await ensureAudioContext();
+      const audioBuffer = await ctx.decodeAudioData(bytes.slice(0));
+      const mono = mixToMono(audioBuffer);
+      const resampled = resampleLinear(mono, audioBuffer.sampleRate, targetRate);
+      return asByteView(resampled);
     }
 
     async function readAudioAsF32Bytes(input, targetRate) {
       if (!input.files.length) throw new Error(`${input.id} is required`);
       const file = input.files[0];
-      if (/\.f32$/i.test(file.name)) return readFileBytes(input);
-      const ctx = await ensureAudioContext();
-      const fileBytes = await file.arrayBuffer();
-      const audioBuffer = await ctx.decodeAudioData(fileBytes.slice(0));
-      const mono = mixToMono(audioBuffer);
-      const resampled = resampleLinear(mono, audioBuffer.sampleRate, targetRate);
-      return asByteView(resampled);
+      return readAudioBufferAsF32Bytes(await file.arrayBuffer(), file.name, targetRate);
+    }
+
+    async function readReferenceAudioAsF32Bytes(targetRate) {
+      const input = document.getElementById('promptPcm');
+      if (input.files.length) return readAudioAsF32Bytes(input, targetRate);
+      const response = await fetch(defaultPromptAudioUrl);
+      if (!response.ok) throw new Error('Default reference audio was not found.');
+      return readAudioBufferAsF32Bytes(await response.arrayBuffer(), 'southern_belle.mp3', targetRate);
     }
 
     async function sendBytesInChunks(ws, bytes, chunkBytes = 32768) {
@@ -482,7 +490,7 @@ module S2sServe =
       message.className = 'status';
       try {
         const mode = inputMode.value;
-        const promptPcm = await readAudioAsF32Bytes(document.getElementById('promptPcm'), 24000);
+        const promptPcm = await readReferenceAudioAsF32Bytes(24000);
         const turnPcm = mode === 'file' ? await readAudioAsF32Bytes(document.getElementById('turnPcm'), 16000) : null;
         const formData = new FormData();
         const maxSeconds = Math.max(1, Math.min(24, Number(document.getElementById('maxResponseSeconds').value) || 12));
@@ -516,6 +524,12 @@ module S2sServe =
 
     inputMode.addEventListener('change', updateMode);
     updateMode();
+    fetch(defaultPromptTextUrl, { cache: 'no-store' })
+      .then(response => response.ok ? response.text() : '')
+      .then(text => {
+        if (text.trim()) document.getElementById('promptText').value = text.trim();
+      })
+      .catch(() => {});
     refreshStatus().catch(error => {
       runtime.textContent = error.message;
       runtime.className = 'bad';
@@ -537,6 +551,20 @@ module S2sServe =
         task {
             ctx.Response.ContentType <- contentType
             do! ctx.Response.WriteAsync(text)
+        }
+
+    let private assetPath fileName =
+        [ Path.Combine(AppContext.BaseDirectory, "assets", fileName)
+          Path.Combine(Directory.GetCurrentDirectory(), "assets", fileName) ]
+        |> List.tryFind File.Exists
+
+    let private serveAsset fileName contentType (ctx: HttpContext) =
+        task {
+            match assetPath fileName with
+            | Some path ->
+                ctx.Response.ContentType <- contentType
+                do! ctx.Response.SendFileAsync(path)
+            | None -> do! writeJson ctx 404 {| error = $"Asset {fileName} was not found."; status = 404 |}
         }
 
     let private error statusCode message =
@@ -1232,6 +1260,8 @@ module S2sServe =
         app.UseWebSockets() |> ignore
 
         app.MapGet("/", RequestDelegate(fun ctx -> task { do! writeText ctx "text/html; charset=utf-8" indexHtml })) |> ignore
+        app.MapGet("/assets/southern_belle.mp3", RequestDelegate(fun ctx -> serveAsset "southern_belle.mp3" "audio/mpeg" ctx)) |> ignore
+        app.MapGet("/assets/southern_belle_prompt.txt", RequestDelegate(fun ctx -> serveAsset "southern_belle_prompt.txt" "text/plain; charset=utf-8" ctx)) |> ignore
         app.MapGet(
             "/api/status",
             RequestDelegate(fun ctx ->

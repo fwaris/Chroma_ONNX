@@ -133,13 +133,11 @@ Reproduce the Python benchmark:
 - `scripts/chroma_s2s_backend.py` runs the Python Chroma comparison backend.
 - `scripts/chroma_s2s_step_debug.py` dumps Python oracle tensors and compares them with F#/ONNX traces.
 - `scripts/rebuild_chroma_local_external_cache.py` rebuilds the ORT 1.27-friendly local-external ONNX cache.
-- `src/ChromaOnnx/ModelStructure.fs` contains shared F# contracts and graph result shapes.
-- `src/ChromaOnnx/SharedWeights.fs` memory maps safetensors and registers ORT initializers.
-- `src/ChromaOnnx/ChromaNativeProcessor.fs` implements tokenizer/chat-template/audio preprocessing.
-- `src/ChromaOnnx/S2sOnnxRunner.fs` implements cacheful S2S ONNX inference.
-- `src/ChromaOnnx/S2sService.fs` implements the local S2S browser lab and API.
-- `src/ChromaOnnx/Cli.fs` contains CLI command implementations.
-- `src/ChromaOnnx/Program.fs` is now only the entry point and command dispatch.
+- `src/ChromaOnnx.Core` contains dependency-light queue, audio chunk, process, and memory helpers.
+- `src/ChromaOnnx.OnnxRuntime` contains tensor utilities, safetensor mapping, native preprocessing, and ONNX runners.
+- `src/ChromaOnnx.SpeechToSpeech` contains the transport-neutral S2S runtime, session store, queueing, streaming events, and artifact persistence.
+- `src/ChromaOnnx.Service` is the deployable F#/ONNX-only ASP.NET service with the browser test page and WebSocket API.
+- `src/ChromaOnnx` remains the research CLI for export/debug/parity/benchmark commands and the legacy labs.
 
 ## Requirements
 
@@ -210,7 +208,7 @@ The quickest working setup on a new Windows machine is:
 
 ```powershell
 git clone <this-repo-url>
-cd py_to_onnx
+cd Chroma_ONNX
 ```
 
 3. Create the Python environment and build the F# project:
@@ -309,31 +307,15 @@ dotnet run --project src\ChromaOnnx -- s2s-offline `
   --optimized-model-cache-format onnx
 ```
 
-9. Start the local ChromaS2SONNX browser service:
+9. Start the standalone ChromaS2SONNX browser service:
 
 ```powershell
-dotnet run --project src\ChromaOnnx -- s2s-serve `
-  --model-dir models/chroma-4b `
-  --bundle-dir onnx/chroma-s2s-full-v2 `
-  --work-dir served_runs `
-  --port 5055 `
-  --execution-provider cuda `
-  --memory-mode resident-merged `
-  --ort-memory-profile quality-safe `
-  --thinker-active-frames 0 `
-  --stream-decode-frames 8 `
-  --stream-min-free-vram-mb 1024 `
-  --cuda-gpu-mem-limit-mb 15360 `
-  --max-queue-length 32 `
-  --max-prompt-audio-seconds 60 `
-  --max-turn-audio-seconds 60 `
-  --optimized-model-cache-dir onnx/chroma-s2s-full-v2/ort-cache-ort-local-external `
-  --optimized-model-cache-format onnx `
-  --python .venv/Scripts/python.exe `
-  --python-device cuda
+dotnet run --project src\ChromaOnnx.Service --urls http://localhost:5055
 ```
 
 Open `http://localhost:5055`.
+
+The standalone service reads `ChromaOnnx:S2s` from `appsettings.json` and environment variables such as `ChromaOnnx__S2s__ModelDir`. It is F#/ONNX-only; Python comparison remains in the research CLI.
 
 Notes for publishing this repo:
 
@@ -487,27 +469,10 @@ For development/debugging, you can still export separate component graphs:
 
 ## Run ChromaS2SONNX
 
-Start the local ChromaS2SONNX browser lab with the merged bundle:
+Start the standalone ChromaS2SONNX browser lab with the merged bundle:
 
 ```powershell
-dotnet run --project src\ChromaOnnx -- s2s-serve `
-  --model-dir models/chroma-4b `
-  --bundle-dir onnx/chroma-s2s-full-v2 `
-  --work-dir served_runs `
-  --port 5055 `
-  --execution-provider cuda `
-  --memory-mode resident-merged `
-  --ort-memory-profile quality-safe `
-  --thinker-active-frames 0 `
-  --stream-decode-frames 4 `
-  --codec-stall-guard-frames 16 `
-  --max-queue-length 32 `
-  --max-prompt-audio-seconds 60 `
-  --max-turn-audio-seconds 60 `
-  --optimized-model-cache-dir onnx/chroma-s2s-full-v2/ort-cache-ort-local-external `
-  --optimized-model-cache-format onnx `
-  --python .venv/Scripts/python.exe `
-  --python-device cuda
+dotnet run --project src\ChromaOnnx.Service --urls http://localhost:5055
 ```
 
 Open:
@@ -516,11 +481,20 @@ Open:
 http://localhost:5055
 ```
 
-The UI supports three backend choices:
+Override defaults with `appsettings.json`, `appsettings.Development.json`, or environment variables. Example:
 
-- `F#/ONNX`: Python-free request path.
-- `Python Chroma`: comparison backend only.
-- `Both`: runs both and shows separate audio/details.
+```powershell
+$env:ChromaOnnx__S2s__ModelDir = "E:\models\chroma-4b"
+$env:ChromaOnnx__S2s__BundleDir = "E:\onnx\chroma-s2s-full-v2"
+$env:ChromaOnnx__S2s__ExecutionProvider = "cuda"
+dotnet run --project src\ChromaOnnx.Service --urls http://localhost:5055
+```
+
+The standalone service accepts only `fsharp_onnx`. Python comparison and `both` mode remain available through the research CLI command `dotnet run --project src\ChromaOnnx -- s2s-serve ...`.
+
+The browser lab defaults its reference text and reference audio to `assets/southern_belle_prompt.txt` and `assets/southern_belle.mp3`; selecting a reference audio file overrides that default.
+
+On 16 GB CUDA cards, the standalone service defaults `CudaGpuMemLimitMb` to `15360` and `StreamMinFreeVramMb` to `2048` to leave VRAM headroom while still giving ORT enough arena space for large prefill allocations. Override those values with `ChromaOnnx__S2s__CudaGpuMemLimitMb` and `ChromaOnnx__S2s__StreamMinFreeVramMb` if your card has more or less VRAM.
 
 API shape:
 
@@ -531,7 +505,7 @@ API shape:
 - `GET /api/s2s/sessions/{id}/{backend}/audio.wav` returns generated WAV.
 - `GET /api/s2s/sessions/{id}/{backend}/details.json` returns run metadata.
 
-ChromaS2SONNX queues generation FIFO and runs one F#/ONNX audio-processing job at a time. Response audio streaming is available for `F#/ONNX`; the Python comparison backend remains final-result only. On CUDA, the service defaults leave VRAM headroom by capping the ORT CUDA arena and deferring partial audio decode when free VRAM is below the configured threshold.
+ChromaS2SONNX queues generation FIFO and runs one F#/ONNX audio-processing job at a time. On CUDA, the service defaults leave VRAM headroom by deferring partial audio decode when free VRAM is below the configured threshold.
 
 The browser lab asks for max response seconds and converts that to Chroma audio frames at roughly 12.5 frames per second. If a run reports `stopReason: "max_frames"` or `truncatedByMaxFrames: true`, increase the response seconds; EOS means the model completed naturally.
 
@@ -669,7 +643,9 @@ The one-frame lab is kept for low-level regression and debugging. The S2S servic
 Recommended checks after code changes:
 
 ```powershell
-dotnet build src\ChromaOnnx
+dotnet build Chroma_ONNX.slnx
+dotnet run --project tests\ChromaOnnx.Tests
+dotnet publish src\ChromaOnnx.Service -c Release
 .venv\Scripts\python.exe -m compileall -q scripts
 ```
 
