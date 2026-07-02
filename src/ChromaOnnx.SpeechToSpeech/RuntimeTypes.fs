@@ -1,6 +1,8 @@
 namespace ChromaOnnx.SpeechToSpeech
 
 open System
+open System.Collections.Generic
+open System.IO
 open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
@@ -23,6 +25,87 @@ type S2sRuntimeOptions() =
     member val MaxQueueLength = 32 with get, set
     member val MaxPromptAudioSeconds = 60.0 with get, set
     member val MaxTurnAudioSeconds = 60.0 with get, set
+
+module S2sRuntimePaths =
+    let private notBlank (value: string | null) =
+        not (String.IsNullOrWhiteSpace value)
+
+    let private normalizeDirectory path =
+        Path.TrimEndingDirectorySeparator(Path.GetFullPath(path))
+
+    let private parentDirectories path =
+        seq {
+            if notBlank path then
+                let mutable current = Some(DirectoryInfo(normalizeDirectory path))
+                let mutable keepGoing = true
+                while keepGoing do
+                    match current with
+                    | None -> keepGoing <- false
+                    | Some directory ->
+                        yield directory.FullName
+                        current <- directory.Parent |> Option.ofObj
+        }
+
+    let private distinctDirectories paths =
+        let seen = HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        paths
+        |> Seq.choose (fun path ->
+            try
+                let normalized = normalizeDirectory path
+                if seen.Add(normalized) then Some normalized else None
+            with _ ->
+                None)
+
+    let private defaultCandidateDirectories () =
+        [| Directory.GetCurrentDirectory(); AppContext.BaseDirectory |]
+
+    let private relativeRequiredPaths paths =
+        paths
+        |> Seq.filter notBlank
+        |> Seq.filter (Path.IsPathRooted >> not)
+        |> Seq.toArray
+
+    let private pathExistsBelow baseDir relativePath =
+        let path = Path.GetFullPath(Path.Combine(baseDir, relativePath))
+        Directory.Exists path || File.Exists path
+
+    let private hasWorkspaceMarker baseDir =
+        File.Exists(Path.Combine(baseDir, "Chroma_ONNX.slnx"))
+        || (File.Exists(Path.Combine(baseDir, "Directory.Packages.props"))
+            && Directory.Exists(Path.Combine(baseDir, "src", "ChromaOnnx.Service")))
+
+    let resolveBaseFromCandidates candidateDirectories requiredPaths =
+        let candidates =
+            candidateDirectories
+            |> Seq.collect parentDirectories
+            |> distinctDirectories
+            |> Seq.toArray
+
+        let fallback () =
+            candidates
+            |> Array.tryHead
+            |> Option.defaultWith Directory.GetCurrentDirectory
+
+        match relativeRequiredPaths requiredPaths with
+        | [||] -> fallback ()
+        | required ->
+            candidates
+            |> Array.tryFind (fun baseDir -> required |> Array.forall (pathExistsBelow baseDir))
+            |> Option.orElseWith (fun () -> candidates |> Array.tryFind hasWorkspaceMarker)
+            |> Option.defaultWith fallback
+
+    let resolveBaseForOptions (options: S2sRuntimeOptions) =
+        resolveBaseFromCandidates
+            (defaultCandidateDirectories ())
+            [| options.ModelDir; options.BundleDir |]
+
+    let resolveAgainst baseDir path =
+        if String.IsNullOrWhiteSpace path then
+            path
+        elif Path.IsPathRooted path then
+            Path.GetFullPath path
+        else
+            Path.GetFullPath(Path.Combine(baseDir, path))
 
 type S2sSessionRequest =
     { PromptText: string

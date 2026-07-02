@@ -79,7 +79,8 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
     let jsonOptions =
         JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, WriteIndented = true)
 
-    let fullPath path = Path.GetFullPath(path)
+    let pathBase = S2sRuntimePaths.resolveBaseForOptions options
+    let fullPath path = S2sRuntimePaths.resolveAgainst pathBase path
     let modelDir = fullPath options.ModelDir
     let bundleDir = fullPath options.BundleDir
     let workDir = fullPath options.WorkDir

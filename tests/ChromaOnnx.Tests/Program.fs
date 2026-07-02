@@ -439,6 +439,37 @@ module Program =
         assertEqual "bound execution provider" "cpu" bound.ExecutionProvider
         assertEqual "bound max queue" 7 bound.MaxQueueLength
 
+    let private runtimePathResolution () =
+        let normalize path = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path))
+        let root = Path.Combine(Path.GetTempPath(), $"chroma-onnx-paths-{Guid.NewGuid():N}")
+        let outputDir = Path.Combine(root, "src", "ChromaOnnx.Service", "bin", "Debug", "net10.0")
+        try
+            Directory.CreateDirectory(Path.Combine(root, "models", "chroma-4b")) |> ignore
+            Directory.CreateDirectory(Path.Combine(root, "onnx", "chroma-s2s-full-v2")) |> ignore
+            Directory.CreateDirectory(outputDir) |> ignore
+            File.WriteAllText(Path.Combine(root, "Chroma_ONNX.slnx"), "<Solution />")
+
+            let defaults = S2sRuntimeOptions()
+            let baseDir =
+                S2sRuntimePaths.resolveBaseFromCandidates
+                    [| outputDir |]
+                    [| defaults.ModelDir; defaults.BundleDir |]
+
+            assertEqual "path base from output dir" (normalize root) baseDir
+            assertEqual
+                "relative model path from output dir"
+                (Path.GetFullPath(Path.Combine(root, defaults.ModelDir)))
+                (S2sRuntimePaths.resolveAgainst baseDir defaults.ModelDir)
+
+            let absoluteWorkDir = Path.Combine(root, "served-runs-absolute")
+            assertEqual
+                "absolute path unchanged"
+                (Path.GetFullPath absoluteWorkDir)
+                (S2sRuntimePaths.resolveAgainst baseDir absoluteWorkDir)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+
     [<EntryPoint>]
     let main _ =
         fifoOrdering ()
@@ -447,6 +478,7 @@ module Program =
         queuedCancellation ()
         float32ChunkRoundtrip ()
         configDefaultsAndBinding ()
+        runtimePathResolution ()
         serviceRejectsPythonBackend ()
         serviceWebSocketAndArtifacts ()
         printfn "All Chroma ONNX tests passed."
