@@ -1,10 +1,12 @@
 namespace ChromaOnnx
 
 open System
+open System.ComponentModel
 open System.Collections.Generic
 open System.IO
 open System.IO.MemoryMappedFiles
 open System.Linq
+open System.Runtime.InteropServices
 open System.Text.Json
 open Microsoft.ML.OnnxRuntime
 open Microsoft.ML.OnnxRuntime.Tensors
@@ -248,6 +250,77 @@ type SharedInitializerRegistry(store: SafetensorWeightStore, entries: SharedInit
                 value.Dispose()
 
 module SharedWeights =
+    [<DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
+    extern bool private CreateHardLinkW(string lpFileName, string lpExistingFileName, nativeint lpSecurityAttributes)
+
+    [<DllImport("libc", SetLastError = true, EntryPoint = "link")>]
+    extern int private LinkUnix(string oldPath, string newPath)
+
+    let private pathComparison =
+        if RuntimeInformation.IsOSPlatform(OSPlatform.Windows) then
+            StringComparison.OrdinalIgnoreCase
+        else
+            StringComparison.Ordinal
+
+    let private pathEquals left right =
+        String.Equals(Path.GetFullPath(left), Path.GetFullPath(right), pathComparison)
+
+    let private hardLink sourcePath targetPath =
+        if RuntimeInformation.IsOSPlatform(OSPlatform.Windows) then
+            if not (CreateHardLinkW(targetPath, sourcePath, 0n)) then
+                let error = Marshal.GetLastWin32Error()
+                raise (IOException($"Could not create hardlink {targetPath} -> {sourcePath}.", Win32Exception(error)))
+        else
+            let result = LinkUnix(sourcePath, targetPath)
+            if result <> 0 then
+                let error = Marshal.GetLastWin32Error()
+                raise (IOException($"Could not create hardlink {targetPath} -> {sourcePath}.", Win32Exception(error)))
+
+    let private linkOrSymlink sourcePath targetPath =
+        try
+            hardLink sourcePath targetPath
+        with hardlinkEx ->
+            try
+                File.CreateSymbolicLink(targetPath, sourcePath) |> ignore
+            with symlinkEx ->
+                raise (
+                    IOException(
+                        $"Could not create local external-data link {targetPath} for safetensor shard {sourcePath}. "
+                        + "Place the model and ONNX bundle on a volume that supports hardlinks, enable symlink creation, "
+                        + "or rebuild the local-external cache with --copy-if-hardlink-fails.",
+                        AggregateException(hardlinkEx, symlinkEx)
+                    )
+                )
+
+    let ensureLocalExternalDataLinks (modelDir: string) (graphPath: string) (entries: SharedInitializerEntry seq) =
+        let graphDir =
+            match Path.GetDirectoryName(graphPath) with
+            | null | "" -> Directory.GetCurrentDirectory()
+            | value -> value
+
+        Directory.CreateDirectory(graphDir) |> ignore
+
+        entries
+        |> Seq.map (fun entry -> entry.SourceShard)
+        |> Seq.distinct
+        |> Seq.iter (fun sourceShard ->
+            let sourcePath = Path.GetFullPath(Path.Combine(modelDir, sourceShard))
+            if not (File.Exists sourcePath) then
+                invalidArg (nameof modelDir) $"Safetensors shard was not found for external-data link: {sourcePath}"
+
+            let targetPath = Path.GetFullPath(Path.Combine(graphDir, sourceShard))
+            if not (pathEquals sourcePath targetPath) then
+                if File.Exists targetPath then
+                    let sourceInfo = FileInfo(sourcePath)
+                    let targetInfo = FileInfo(targetPath)
+                    if sourceInfo.Length <> targetInfo.Length then
+                        invalidOp (
+                            $"External-data link target already exists with a different size: {targetPath}. "
+                            + $"Expected {sourceInfo.Length} bytes from {sourcePath}, found {targetInfo.Length} bytes."
+                        )
+                else
+                    linkOrSymlink sourcePath targetPath)
+
     let private tryGetInt (name: string) (root: JsonElement) =
         match root.TryGetProperty(name) with
         | true, value when value.ValueKind = JsonValueKind.Number ->

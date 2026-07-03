@@ -36,8 +36,16 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
            "decoder_step"
            "codec_decode" |]
 
+    let log message =
+        printfn "[%s] ChromaS2SONNX: %s" (DateTimeOffset.Now.ToString("HH:mm:ss")) message
+        Console.Out.Flush()
+
+    let elapsedSeconds (stopwatch: Stopwatch) =
+        $"{stopwatch.Elapsed.TotalSeconds:N1}s"
+
     let manifest =
         if File.Exists manifestPath then
+            log $"Loading S2S bundle manifest: {manifestPath}"
             Some(SharedWeights.loadManifest bundleDir)
         else
             None
@@ -103,6 +111,18 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
             else
                 None)
 
+    let requireConfiguredOptimizedCache graphName =
+        match optimizedModelCachePath graphName with
+        | Some path when (existingOptimizedModelCachePath graphName).IsNone ->
+            let cacheDir = optimizedModelCacheDir |> Option.defaultValue "<unset>"
+            let provider = executionProvider.Trim().ToLowerInvariant()
+            invalidOp (
+                $"Optimized model cache is configured, but the expected cache file is missing or empty for graph '{graphName}': {path}. "
+                + $"Build the machine-local cache before starting the service: .venv\\Scripts\\python.exe scripts\\rebuild_chroma_local_external_cache.py --model-dir \"{modelDir}\" --bundle-dir \"{bundleDir}\" --cache-dir \"{cacheDir}\" --provider {provider} --memory-profile {normalizedOrtMemoryProfile}. "
+                + "Keep cache files under ignored onnx/ so large safetensor links are not created under committed onnx_deploy/."
+            )
+        | _ -> ()
+
     let useExistingOrtCacheWithoutRegistry =
         useMergedSession
         && normalizedOptimizedModelCacheFormat = "ort"
@@ -113,11 +133,23 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
             None
         else
             manifest
-            |> Option.map (fun value -> new SafetensorWeightStore(modelDir, value.Initializers))
+            |> Option.map (fun value ->
+                log $"Mapping safetensor shards from {modelDir}"
+                let stopwatch = Stopwatch.StartNew()
+                let weightStore = new SafetensorWeightStore(modelDir, value.Initializers)
+                stopwatch.Stop()
+                log $"Mapped {weightStore.MappedShardCount} safetensor shard(s) in {elapsedSeconds stopwatch}"
+                weightStore)
 
     let registry =
         match manifest, store with
-        | Some value, Some weightStore -> Some(new SharedInitializerRegistry(weightStore, value.Initializers))
+        | Some value, Some weightStore ->
+            log $"Preparing shared ORT initializer views for {value.Initializers.Length} manifest entries"
+            let stopwatch = Stopwatch.StartNew()
+            let registry = new SharedInitializerRegistry(weightStore, value.Initializers)
+            stopwatch.Stop()
+            log $"Prepared {registry.InitializerCount} initializer binding(s), {registry.UniqueOrtValueCount} unique ORT value(s), in {elapsedSeconds stopwatch}"
+            Some registry
         | _ -> None
 
     let prepackedWeights = new PrePackedWeightsContainer()
@@ -217,6 +249,7 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
                 if not (File.Exists graph.Path) then
                     invalidArg graphName $"S2S ONNX graph was not found: {graph.Path}"
 
+                requireConfiguredOptimizedCache graphName
                 let options, sessionPath = createOptions graphName graph.Path
                 registry
                 |> Option.iter (fun registryValue ->
@@ -230,7 +263,26 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
                             registryValue.AddAllInitializers(options)
                     else
                         registryValue.AddInitializers(options, graphName))
-                new InferenceSession(sessionPath, options, prepackedWeights), options
+                let graphEntries =
+                    value.Initializers
+                    |> Array.filter (fun entry -> entry.Graph = graphName)
+
+                let shardCount =
+                    graphEntries
+                    |> Seq.map (fun entry -> entry.SourceShard)
+                    |> Seq.distinct
+                    |> Seq.length
+
+                if shardCount > 0 then
+                    log $"Ensuring {shardCount} local safetensor external-data link(s) for graph '{graphName}'"
+                    SharedWeights.ensureLocalExternalDataLinks modelDir sessionPath graphEntries
+
+                log $"Creating ONNX Runtime session for graph '{graphName}' from {sessionPath}"
+                let stopwatch = Stopwatch.StartNew()
+                let session = new InferenceSession(sessionPath, options, prepackedWeights)
+                stopwatch.Stop()
+                log $"ONNX Runtime session for graph '{graphName}' is ready in {elapsedSeconds stopwatch}"
+                session, options
 
     let mergedSession = lazy (createSession mergedGraphName)
     let warmSessions = ConcurrentDictionary<string, Lazy<InferenceSession * SessionOptions>>(StringComparer.Ordinal)
@@ -251,8 +303,12 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
     do
         observeProcessMemory()
         if useMergedSession && missingGraphs.Length = 0 then
+            log "Resident merged mode selected; loading merged S2S ONNX session before service startup completes"
+            let stopwatch = Stopwatch.StartNew()
             let _ = mergedSession.Value
+            stopwatch.Stop()
             observeProcessMemory()
+            log $"Resident merged S2S session loaded in {elapsedSeconds stopwatch}"
 
     let getWarmSession graphName =
         warmSessions.GetOrAdd(graphName, fun name -> lazy (createSession name)).Value
@@ -574,13 +630,19 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
                 logitsOwner.Dispose()
                 reraise())
 
-    let greedyAudioFrame (logits: DenseTensor<float32>) (hiddenStates: DenseTensor<float32>) =
-        let firstIds = TensorMath.argmaxLast logits
+    let audioFrame (samplingOptions: S2sSamplingOptions) (logits: DenseTensor<float32>) (hiddenStates: DenseTensor<float32>) =
+        let selectNextIds (logits: DenseTensor<float32>) =
+            if samplingOptions.Enabled then
+                TensorMath.sampleLast Random.Shared samplingOptions.Temperature samplingOptions.TopP samplingOptions.TopK logits
+            else
+                TensorMath.argmaxLast logits
+
+        let firstIds = selectNextIds logits
         let hidden = TensorMath.lastHidden hiddenStates
         let mutable ids = DenseTensor<int64>(firstIds, [| firstIds.Length; 1 |])
         let mutable decoderOutput = runDecoderPrefill ids hidden
         try
-            let mutable nextIds = TensorMath.argmaxLast decoderOutput.Logits
+            let mutable nextIds = selectNextIds decoderOutput.Logits
             ids <- TensorMath.appendColumn ids nextIds
 
             for _ in 3 .. audioNumCodebooks do
@@ -589,12 +651,15 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
                 let previousDecoderOutput = decoderOutput
                 decoderOutput <- nextDecoderOutput
                 (previousDecoderOutput :> IDisposable).Dispose()
-                nextIds <- TensorMath.argmaxLast decoderOutput.Logits
+                nextIds <- selectNextIds decoderOutput.Logits
                 ids <- TensorMath.appendColumn ids nextIds
         finally
             (decoderOutput :> IDisposable).Dispose()
 
         ids
+
+    let greedyAudioFrame (logits: DenseTensor<float32>) (hiddenStates: DenseTensor<float32>) =
+        audioFrame S2sSamplingOptions.Greedy logits hiddenStates
 
     let validateAudioFrame (frame: DenseTensor<int64>) =
         let dims = frame.Dimensions
@@ -691,13 +756,17 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
     let frameCount (frames: ResizeArray<int64>) =
         frames.Count / audioNumCodebooks
 
-    let framesToCodecTensor (frames: ResizeArray<int64>) =
-        let frameCount = frameCount frames
+    let framesToCodecTensorWithCount (frames: ResizeArray<int64>) requestedFrameCount =
+        let availableFrameCount = frameCount frames
+        let frameCount = max 0 (min requestedFrameCount availableFrameCount)
         let values = Array.zeroCreate<int64> (audioNumCodebooks * frameCount)
         for frameIndex in 0 .. frameCount - 1 do
             for codebookIndex in 0 .. audioNumCodebooks - 1 do
                 values[codebookIndex * frameCount + frameIndex] <- frames[(frameIndex * audioNumCodebooks) + codebookIndex]
         DenseTensor<int64>(values, [| 1; audioNumCodebooks; frameCount |])
+
+    let framesToCodecTensor (frames: ResizeArray<int64>) =
+        framesToCodecTensorWithCount frames (frameCount frames)
 
     let frameToArray (frame: DenseTensor<int64>) =
         let values = Array.zeroCreate<int64> audioNumCodebooks
@@ -712,6 +781,14 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         if count > 0 then
             audio.Buffer.Span.Slice(startSample, count).CopyTo(samples.AsSpan())
         samples
+
+    let audioPrefix sampleCount (audio: DenseTensor<float32>) =
+        let totalSamples = tensorElementCount (audio.Dimensions.ToArray())
+        let sampleCount = max 0 (min sampleCount totalSamples)
+        let samples = Array.zeroCreate<float32> sampleCount
+        if sampleCount > 0 then
+            audio.Buffer.Span.Slice(0, sampleCount).CopyTo(samples.AsSpan())
+        DenseTensor<float32>(samples, [| 1; 1; sampleCount |])
 
     let runCodecDecode (audioCodes: DenseTensor<int64>) =
         let graphName = "codec_decode"
@@ -957,7 +1034,9 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         if not status.Ready then
             invalidOp status.Message
 
-    member _.CreateSessionOptions() = fst (createOptions mergedGraphName "")
+    member _.CreateSessionOptions() =
+        requireConfiguredOptimizedCache mergedGraphName
+        fst (createOptions mergedGraphName "")
 
     member this.WriteDebug(prepared: NativeS2sPrepared, outputDir: string, ?maxFrames: int) =
         this.EnsureReady()
@@ -1078,7 +1157,7 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         this.GenerateStreaming(
             prepared,
             maxNewFrames,
-            Int32.MaxValue,
+            4,
             ignore,
             ignore,
             CancellationToken.None
@@ -1093,16 +1172,27 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
             onAudioChunk: S2sAudioChunk -> unit,
             cancellationToken: CancellationToken,
             ?shouldDecodeChunk: int -> bool,
-            ?codecStallGuardFrames: int
+            ?codecStallGuardFrames: int,
+            ?samplingOptions: S2sSamplingOptions
         ) =
         this.EnsureReady()
         if maxNewFrames < 1 then
             invalidArg (nameof maxNewFrames) "maxNewFrames must be positive."
 
         let streamDecodeFrames = max 1 streamDecodeFrames
-        let codecStallGuardFrames = defaultArg codecStallGuardFrames 0 |> max 0
-        let codecStallMinFrames = 50
+        let codecStallGuardFrames = defaultArg codecStallGuardFrames 16 |> max 0
+        let samplingOptions = defaultArg samplingOptions S2sSamplingOptions.Greedy
+        let outputSampleRate = 24000
+        let outputSamplesPerFrame = 1920
+        let decodedSilenceRmsThreshold = 0.001
+        let decodedSilenceGuardSeconds = 1.0
+        let decodedSilenceGuardSamples = int (float outputSampleRate * decodedSilenceGuardSeconds)
+        let decodedSilenceGuardEnabled = codecStallGuardFrames > 0
         let timings = Dictionary<string, float>(StringComparer.Ordinal)
+        timings["samplingEnabled"] <- if samplingOptions.Enabled then 1.0 else 0.0
+        timings["samplingTemperature"] <- samplingOptions.Temperature
+        timings["samplingTopP"] <- samplingOptions.TopP
+        timings["samplingTopK"] <- float samplingOptions.TopK
         let stopwatch = Stopwatch.StartNew()
         let shouldDecodeChunk = defaultArg shouldDecodeChunk (fun _ -> true)
         cancellationToken.ThrowIfCancellationRequested()
@@ -1114,21 +1204,88 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         let mutable emittedFrameStart = 0
         let mutable nextStreamDecodeFrame = streamDecodeFrames
         let mutable emittedSampleStart = 0
+        let mutable analyzedSampleStart = 0
         let mutable chunkIndex = 0
         let mutable decodeMs = 0.0
         let mutable streamDecodeSkips = 0
-        let mutable previousStallFrame = Array.empty<int64>
-        let mutable hasPreviousStallFrame = false
-        let mutable repeatedFrameRunFrames = 0
-        let mutable repeatedFrameRunStartFrame = -1
-        let mutable maxRepeatedFrameRunFrames = 0
-        let mutable stallStartFrame = -1
+        let mutable hasAudibleDecodedSamples = false
+        let mutable decodedSilenceRunSamples = 0
+        let mutable decodedSilenceRunStartSample = -1
+        let mutable maxDecodedSilenceRunSamples = 0
+        let mutable decodedSilenceStallStartSample = -1
+        let mutable decodedSilenceStallSampleCount = 0
         let mutable state = prefill.State
         let mutable stateIsLive = true
         let disposeCurrentState () =
             if stateIsLive then
                 stateIsLive <- false
                 (state :> IDisposable).Dispose()
+
+        let sampleRms (samples: float32 array) start count =
+            if count <= 0 then
+                0.0
+            else
+                let mutable sumSquares = 0.0
+                let stop = start + count - 1
+                for index in start .. stop do
+                    let value = float samples[index]
+                    sumSquares <- sumSquares + (value * value)
+                Math.Sqrt(sumSquares / float count)
+
+        let noteDecodedSilenceStall startSample sampleCount =
+            if decodedSilenceStallStartSample < 0 then
+                decodedSilenceStallStartSample <- startSample
+                decodedSilenceStallSampleCount <- sampleCount
+            true
+
+        let updateDecodedSilenceGuard startSample (samples: float32 array) =
+            if not decodedSilenceGuardEnabled || samples.Length = 0 || decodedSilenceStallStartSample >= 0 then
+                false
+            else
+                let rms = sampleRms samples 0 samples.Length
+                if rms < decodedSilenceRmsThreshold then
+                    if hasAudibleDecodedSamples then
+                        if decodedSilenceRunSamples = 0 then
+                            decodedSilenceRunStartSample <- startSample
+                        decodedSilenceRunSamples <- decodedSilenceRunSamples + samples.Length
+                        maxDecodedSilenceRunSamples <- max maxDecodedSilenceRunSamples decodedSilenceRunSamples
+                        if decodedSilenceRunSamples >= decodedSilenceGuardSamples then
+                            noteDecodedSilenceStall decodedSilenceRunStartSample decodedSilenceRunSamples
+                        else
+                            false
+                    else
+                        false
+                else
+                    hasAudibleDecodedSamples <- true
+                    decodedSilenceRunSamples <- 0
+                    decodedSilenceRunStartSample <- -1
+                    false
+
+        let findDecodedSilenceStall (samples: float32 array) =
+            if not decodedSilenceGuardEnabled || samples.Length = 0 then
+                None
+            else
+                let mutable found: (int * int) option = None
+                let mutable localHasAudible = false
+                let mutable localRunSamples = 0
+                let mutable localRunStart = -1
+                let mutable index = 0
+                while Option.isNone found && index < samples.Length do
+                    let count = min outputSamplesPerFrame (samples.Length - index)
+                    let rms = sampleRms samples index count
+                    if rms < decodedSilenceRmsThreshold then
+                        if localHasAudible then
+                            if localRunSamples = 0 then
+                                localRunStart <- index
+                            localRunSamples <- localRunSamples + count
+                            if localRunSamples >= decodedSilenceGuardSamples then
+                                found <- Some(localRunStart, localRunSamples)
+                    else
+                        localHasAudible <- true
+                        localRunSamples <- 0
+                        localRunStart <- -1
+                    index <- index + count
+                found
 
         let emitFrame stepKind (frame: DenseTensor<int64>) =
             onFrame
@@ -1141,72 +1298,55 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
             cancellationToken.ThrowIfCancellationRequested()
             let currentFrameCount = frameCount frames
             let chunkIsDue = currentFrameCount > 0 && (force || currentFrameCount >= nextStreamDecodeFrame)
-            if chunkIsDue && (force || shouldDecodeChunk currentFrameCount) then
-                let codes = framesToCodecTensor frames
-                let decodeWatch = Stopwatch.StartNew()
-                let audio, audioOwner = runCodecDecode codes
-                decodeWatch.Stop()
-                decodeMs <- decodeMs + decodeWatch.Elapsed.TotalMilliseconds
-                try
-                    let samples = audioSamplesFrom emittedSampleStart audio
-                    if samples.Length > 0 then
-                        onAudioChunk
-                            { ChunkIndex = chunkIndex
-                              StartFrame = emittedFrameStart
-                              FrameCount = currentFrameCount - emittedFrameStart
-                              StartSample = emittedSampleStart
-                              SampleRate = 24000
-                              Samples = samples }
-                        chunkIndex <- chunkIndex + 1
-                        emittedSampleStart <- emittedSampleStart + samples.Length
-                    emittedFrameStart <- currentFrameCount
-                    nextStreamDecodeFrame <- currentFrameCount + streamDecodeFrames
-                finally
-                    audioOwner.Dispose()
-            elif chunkIsDue then
-                streamDecodeSkips <- streamDecodeSkips + 1
+            let mutable silenceStalled = false
+            if chunkIsDue then
+                let shouldEmitChunk = force || shouldDecodeChunk currentFrameCount
+                if not shouldEmitChunk then
+                    streamDecodeSkips <- streamDecodeSkips + 1
+
+                if shouldEmitChunk || decodedSilenceGuardEnabled then
+                    let codes = framesToCodecTensor frames
+                    let decodeWatch = Stopwatch.StartNew()
+                    let audio, audioOwner = runCodecDecode codes
+                    decodeWatch.Stop()
+                    decodeMs <- decodeMs + decodeWatch.Elapsed.TotalMilliseconds
+                    try
+                        let guardSamples = audioSamplesFrom analyzedSampleStart audio
+                        if guardSamples.Length > 0 then
+                            silenceStalled <- updateDecodedSilenceGuard analyzedSampleStart guardSamples
+                            analyzedSampleStart <- analyzedSampleStart + guardSamples.Length
+
+                        if shouldEmitChunk then
+                            let samples = audioSamplesFrom emittedSampleStart audio
+                            if samples.Length > 0 then
+                                onAudioChunk
+                                    { ChunkIndex = chunkIndex
+                                      StartFrame = emittedFrameStart
+                                      FrameCount = currentFrameCount - emittedFrameStart
+                                      StartSample = emittedSampleStart
+                                      SampleRate = outputSampleRate
+                                      Samples = samples }
+                                chunkIndex <- chunkIndex + 1
+                                emittedSampleStart <- emittedSampleStart + samples.Length
+                            emittedFrameStart <- currentFrameCount
+                    finally
+                        audioOwner.Dispose()
                 nextStreamDecodeFrame <- currentFrameCount + streamDecodeFrames
-
-        let updateCodecStallGuard (frame: DenseTensor<int64>) =
-            if codecStallGuardFrames <= 0 || frameIsEos frame then
-                false
-            else
-                let frameIndex = frameCount frames - 1
-                let currentFrame = frameToArray frame
-                let isRepeat = hasPreviousStallFrame && frameArraysEqual previousStallFrame currentFrame
-
-                if isRepeat then
-                    repeatedFrameRunFrames <- repeatedFrameRunFrames + 1
-                    maxRepeatedFrameRunFrames <- max maxRepeatedFrameRunFrames repeatedFrameRunFrames
-
-                    if frameCount frames >= codecStallMinFrames && repeatedFrameRunFrames >= codecStallGuardFrames then
-                        stallStartFrame <- repeatedFrameRunStartFrame
-                        true
-                    else
-                        false
-                else
-                    previousStallFrame <- currentFrame
-                    hasPreviousStallFrame <- true
-                    repeatedFrameRunFrames <- 1
-                    repeatedFrameRunStartFrame <- frameIndex
-                    maxRepeatedFrameRunFrames <- max maxRepeatedFrameRunFrames repeatedFrameRunFrames
-                    false
+            silenceStalled
 
         try
             let mutable current =
                 try
-                    greedyAudioFrame prefill.Logits prefill.HiddenStates
+                    audioFrame samplingOptions prefill.Logits prefill.HiddenStates
                 finally
                     (prefill :> IDisposable).Dispose()
 
             appendFrame frames current
             stepKinds.Add("prefill")
             emitFrame "prefill" current
-            emitDecodedChunk false
+            emitDecodedChunk false |> ignore
             let mutable currentInput = frameToInputIds current
             let mutable stopReason = if frameIsEos current then "eos" else "max_frames"
-            if stopReason <> "eos" then
-                updateCodecStallGuard current |> ignore
             let mutable useThinker = false
 
             while frameCount frames < maxNewFrames && stopReason = "max_frames" do
@@ -1226,7 +1366,7 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
                 stateIsLive <- true
                 try
                     (previousState :> IDisposable).Dispose()
-                    current <- greedyAudioFrame step.Logits step.HiddenStates
+                    current <- audioFrame samplingOptions step.Logits step.HiddenStates
                 finally
                     (step :> IDisposable).Dispose()
 
@@ -1234,8 +1374,7 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
                     appendFrame frames current
                     stepKinds.Add(stepKind)
                     emitFrame stepKind current
-                    emitDecodedChunk false
-                    if stopReason <> "eos" && updateCodecStallGuard current then
+                    if emitDecodedChunk false then
                         stopReason <- "codec_stall"
                 currentInput <- frameToInputIds current
                 if frameIsEos current then
@@ -1250,33 +1389,72 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
             decodeWatch.Stop()
             try
                 decodeMs <- decodeMs + decodeWatch.Elapsed.TotalMilliseconds
-                let finalSamples = audioSamplesFrom emittedSampleStart audio
+                let mutable resultCodes = codes
+                let mutable resultAudio = audio
+                let mutable resultAudioOwners: IDisposable array = [| audioOwner |]
+                let mutable resultFrameCount = frameCount frames
+                let totalDecodedSamples = tensorElementCount (audio.Dimensions.ToArray())
+
+                if stopReason <> "eos" && decodedSilenceGuardEnabled then
+                    let silenceStall =
+                        if decodedSilenceStallStartSample >= 0 then
+                            Some(decodedSilenceStallStartSample, max decodedSilenceStallSampleCount decodedSilenceGuardSamples)
+                        else
+                            audioSamplesFrom 0 audio
+                            |> findDecodedSilenceStall
+
+                    match silenceStall with
+                    | Some(startSample, sampleCount) ->
+                        noteDecodedSilenceStall startSample sampleCount |> ignore
+                        stopReason <- "codec_stall"
+                        let keepSamples = min totalDecodedSamples (startSample + decodedSilenceGuardSamples)
+                        let keepFrames =
+                            max 1 (min resultFrameCount ((keepSamples + outputSamplesPerFrame - 1) / outputSamplesPerFrame))
+                        let keepSamples = min totalDecodedSamples (keepFrames * outputSamplesPerFrame)
+                        if keepFrames < resultFrameCount || keepSamples < totalDecodedSamples then
+                            resultCodes <- framesToCodecTensorWithCount frames keepFrames
+                            resultAudio <- audioPrefix keepSamples audio
+                            resultFrameCount <- keepFrames
+                            resultAudioOwners <- Array.empty
+                            audioOwner.Dispose()
+                            emittedSampleStart <- min emittedSampleStart keepSamples
+                            emittedFrameStart <- min emittedFrameStart keepFrames
+                            timings["decodedSilenceTrimmedFrames"] <- float (frameCount frames - keepFrames)
+                            timings["decodedSilenceTrimmedSeconds"] <- float (totalDecodedSamples - keepSamples) / float outputSampleRate
+                    | None -> ()
+
+                let finalSamples = audioSamplesFrom emittedSampleStart resultAudio
                 if finalSamples.Length > 0 then
                     onAudioChunk
                         { ChunkIndex = chunkIndex
                           StartFrame = emittedFrameStart
-                          FrameCount = frameCount frames - emittedFrameStart
+                          FrameCount = resultFrameCount - emittedFrameStart
                           StartSample = emittedSampleStart
-                          SampleRate = 24000
+                          SampleRate = outputSampleRate
                           Samples = finalSamples }
                     emittedSampleStart <- emittedSampleStart + finalSamples.Length
-                    emittedFrameStart <- frameCount frames
+                    emittedFrameStart <- resultFrameCount
                 timings["decodeMs"] <- decodeMs
                 timings["streamDecodeSkips"] <- float streamDecodeSkips
-                timings["maxRepeatedFrameRunFrames"] <- float maxRepeatedFrameRunFrames
-                timings["codecStallGuardFrames"] <- float codecStallGuardFrames
-                timings["codecStallMinFrames"] <- float codecStallMinFrames
-                if stallStartFrame >= 0 then
-                    timings["codecStallStartFrame"] <- float stallStartFrame
+                timings["decodedSilenceRmsThreshold"] <- decodedSilenceRmsThreshold
+                timings["decodedSilenceGuardSeconds"] <- decodedSilenceGuardSeconds
+                timings["decodedSilenceGuardSamples"] <- float decodedSilenceGuardSamples
+                timings["maxDecodedSilenceSeconds"] <- float maxDecodedSilenceRunSamples / float outputSampleRate
+                if decodedSilenceStallStartSample >= 0 then
+                    timings["decodedSilenceStallStartSample"] <- float decodedSilenceStallStartSample
+                    timings["decodedSilenceStallStartFrame"] <- float decodedSilenceStallStartSample / float outputSamplesPerFrame
+                    timings["decodedSilenceStallSeconds"] <- float decodedSilenceStallSampleCount / float outputSampleRate
                 timings["totalMs"] <- stopwatch.Elapsed.TotalMilliseconds
+                let resultStepKindCount = min resultFrameCount stepKinds.Count
+                let resultStepKinds = Array.init resultStepKindCount (fun index -> stepKinds[index])
 
-                { AudioCodes = codes
-                  AudioValues = audio
-                  FrameCount = frameCount frames
+                { AudioCodes = resultCodes
+                  AudioValues = resultAudio
+                  FrameCount = resultFrameCount
                   StopReason = stopReason
-                  StepKinds = stepKinds.ToArray()
+                  StepKinds = resultStepKinds
                   Timings = timings
-                  OwnedBuffers = [| audioOwner |] }
+                  OwnedBuffers = resultAudioOwners }
             with
             | _ ->
                 audioOwner.Dispose()

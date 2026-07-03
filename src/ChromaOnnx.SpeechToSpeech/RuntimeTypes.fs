@@ -10,7 +10,7 @@ open ChromaOnnx
 
 type S2sRuntimeOptions() =
     member val ModelDir = "models/chroma-4b" with get, set
-    member val BundleDir = "onnx/chroma-s2s-full-v2" with get, set
+    member val BundleDir = "onnx_deploy/chroma-s2s-full-v2" with get, set
     member val WorkDir = "served_runs" with get, set
     member val ExecutionProvider = "cuda" with get, set
     member val MemoryMode = "resident-merged" with get, set
@@ -22,6 +22,10 @@ type S2sRuntimeOptions() =
     member val StreamDecodeFrames = 4 with get, set
     member val StreamMinFreeVramMb = 2048 with get, set
     member val CodecStallGuardFrames = 16 with get, set
+    member val GenerationMode = "sample" with get, set
+    member val SamplingTemperature = 0.8 with get, set
+    member val SamplingTopP = 0.95 with get, set
+    member val SamplingTopK = 50 with get, set
     member val MaxQueueLength = 32 with get, set
     member val MaxPromptAudioSeconds = 60.0 with get, set
     member val MaxTurnAudioSeconds = 60.0 with get, set
@@ -190,6 +194,10 @@ type S2sRuntimeStatus =
       StreamDecodeFrames: int
       StreamMinFreeVramMb: int
       CodecStallGuardFrames: int
+      GenerationMode: string
+      SamplingTemperature: float
+      SamplingTopP: float
+      SamplingTopK: int
       MaxPromptAudioSeconds: float
       MaxTurnAudioSeconds: float
       GlobalGpuMemory: RuntimeMemory.GpuGlobalSnapshot option

@@ -10,7 +10,7 @@ Chroma model files, weights, remote model code, tokenizer/processor files, and g
 
 ## Current Status
 
-- The default tested S2S bundle is `onnx/chroma-s2s-full-v2`.
+- The default S2S deploy bundle is `onnx_deploy/chroma-s2s-full-v2`.
 - The S2S runtime loads one merged weights-free ONNX graph: `chroma_s2s_merged.weights_free.onnx`.
 - Model weights are loaded from the original Hugging Face safetensors through shared ORT initializers.
 - F#/ONNX owns preprocessing, cacheful generation, codec decode, WAV output, service state, and persistence.
@@ -36,7 +36,7 @@ Benchmark fixture:
 - User turn: `served_runs/compare_inputs/make_taco_16k.f32`
 - Greedy deterministic generation: `do_sample=False`, `use_cache=True`, `output_audio=True`
 - F#/ONNX mode: `resident-merged`, `quality-safe`, `thinker-active-frames 0`
-- Bundle/cache: `onnx/chroma-s2s-full-v2` with `ort-cache-ort-local-external`
+- Bundle/cache: `onnx_deploy/chroma-s2s-full-v2` with locally rebuilt cache under `onnx/chroma-s2s-full-v2/ort-cache-ort-local-external`
 - Quality mode disables TF32 in both Python comparison tooling and ORT to preserve deterministic RVQ/code selection.
 
 Test machine/environment:
@@ -93,7 +93,7 @@ Reproduce the F#/ONNX benchmark:
 ```powershell
 dotnet run --project src\ChromaOnnx -- s2s-benchmark `
   --model-dir models/chroma-4b `
-  --bundle-dir onnx/chroma-s2s-full-v2 `
+  --bundle-dir onnx_deploy/chroma-s2s-full-v2 `
   --prompt-text "War and bloodshed throughout the world." `
   --prompt-audio-f32 served_runs/compare_inputs/reference_audio_24k.f32 `
   --user-audio-f32 served_runs/compare_inputs/make_taco_16k.f32 `
@@ -106,7 +106,8 @@ dotnet run --project src\ChromaOnnx -- s2s-benchmark `
   --ort-memory-profile quality-safe `
   --thinker-active-frames 0 `
   --optimized-model-cache-dir onnx/chroma-s2s-full-v2/ort-cache-ort-local-external `
-  --optimized-model-cache-format onnx
+  --optimized-model-cache-format onnx `
+  --cuda-gpu-mem-limit-mb 15360
 ```
 
 Reproduce the Python benchmark:
@@ -262,16 +263,26 @@ If the safetensors were downloaded manually, place the full Hugging Face model s
   --min-free-gib 2
 ```
 
-6. Export the merged F#/ONNX S2S bundle:
+6. Use the committed deploy bundle, or regenerate it after changing export code.
+
+The repository carries the portable, weights-free S2S artifacts in `onnx_deploy/chroma-s2s-full-v2`:
+
+```text
+onnx_deploy/chroma-s2s-full-v2/
+  chroma_s2s_merged.weights_free.onnx
+  shared_weights_manifest.json
+```
+
+The bundle expects the original safetensor shards under `models/chroma-4b`. If you need to refresh the deploy bundle from scratch, run:
 
 ```powershell
 .venv\Scripts\python.exe scripts\export_chroma_onnx.py `
   --model-dir models/chroma-4b `
-  --output-dir onnx/chroma-s2s-full-v2 `
+  --output-dir onnx_deploy/chroma-s2s-full-v2 `
   --bundle safetensor-shared-s2s `
   --device cuda `
   --dtype float32 `
-  --thinker-active-frames 0 `
+  --thinker-active-frames 1 `
   --single-onnx-s2s `
   --validate
 ```
@@ -281,19 +292,22 @@ If the safetensors were downloaded manually, place the full Hugging Face model s
 ```powershell
 .venv\Scripts\python.exe scripts\rebuild_chroma_local_external_cache.py `
   --model-dir models/chroma-4b `
-  --bundle-dir onnx/chroma-s2s-full-v2 `
+  --bundle-dir onnx_deploy/chroma-s2s-full-v2 `
+  --cache-dir onnx/chroma-s2s-full-v2/ort-cache-ort-local-external `
   --provider cuda `
   --memory-profile quality-safe
 ```
 
-The cache directory contains hardlinks to the upstream safetensors when `models` and `onnx` are on the same NTFS volume. They may appear as large files in Explorer, but they should not consume another full copy of disk space.
+The cache builder creates ignored local hardlinks for the safetensor shards under `onnx/`. They may appear as large files in Explorer, but hardlinks should not consume another full copy of disk space. The standalone service uses this optimized cache by default and fails fast with a rebuild command if the expected cache file is missing.
+
+The cache directory also contains hardlinks to the upstream safetensors when `models` and `onnx` are on the same NTFS volume.
 
 8. Run a one-frame smoke test:
 
 ```powershell
 dotnet run --project src\ChromaOnnx -- s2s-offline `
   --model-dir models/chroma-4b `
-  --bundle-dir onnx/chroma-s2s-full-v2 `
+  --bundle-dir onnx_deploy/chroma-s2s-full-v2 `
   --prompt-text "War" `
   --prompt-audio-f32 served_runs/compare_inputs/reference_audio_24k.f32 `
   --user-audio-f32 served_runs/compare_inputs/make_taco_16k.f32 `
@@ -304,7 +318,8 @@ dotnet run --project src\ChromaOnnx -- s2s-offline `
   --ort-memory-profile quality-safe `
   --thinker-active-frames 0 `
   --optimized-model-cache-dir onnx/chroma-s2s-full-v2/ort-cache-ort-local-external `
-  --optimized-model-cache-format onnx
+  --optimized-model-cache-format onnx `
+  --cuda-gpu-mem-limit-mb 15360
 ```
 
 9. Start the standalone ChromaS2SONNX browser service:
@@ -320,25 +335,26 @@ The standalone service reads `ChromaOnnx:S2s` from `appsettings.json` and enviro
 Notes for publishing this repo:
 
 - Do not commit `models/chroma-4b/*.safetensors`.
-- Do not commit generated `onnx/chroma-s2s-full-v2` artifacts unless you intentionally want to publish the ONNX metadata/cache.
+- Keep `onnx/` as ignored scratch output. `onnx_deploy/chroma-s2s-full-v2` is the intended portable weights-free deploy bundle.
+- Do not commit generated cache directories, runtime-created safetensor hardlinks, `.ort` files, or TensorRT engine output under `onnx_deploy`.
 - If publishing generated ONNX/model artifacts, include the applicable upstream Chroma notices and comply with the upstream model access terms.
 - The essential reproducible source is the code, scripts, project files, and this README.
 - New users should obtain the gated Chroma weights directly from the upstream Hugging Face repo using their own accepted license/token.
 
 ## Fresh Rebuild After Downloading Chroma
 
-After downloading or refreshing the Hugging Face `FlashLabs/Chroma-4B` repo under `models/chroma-4b`, rebuild the F#/ONNX bundle and local cache in this order.
+After downloading or refreshing the Hugging Face `FlashLabs/Chroma-4B` repo under `models/chroma-4b`, the committed `onnx_deploy/chroma-s2s-full-v2` bundle provides the portable weights-free graph metadata. Build the local optimized cache under ignored `onnx/` on each machine before starting the default CUDA service. Rebuild the F#/ONNX bundle itself only when you need to refresh generated artifacts.
 
 1. Export the merged safetensor-backed S2S ONNX bundle:
 
 ```powershell
 .venv\Scripts\python.exe scripts\export_chroma_onnx.py `
   --model-dir models/chroma-4b `
-  --output-dir onnx/chroma-s2s-full-v2 `
+  --output-dir onnx_deploy/chroma-s2s-full-v2 `
   --bundle safetensor-shared-s2s `
   --device cuda `
   --dtype float32 `
-  --thinker-active-frames 0 `
+  --thinker-active-frames 1 `
   --single-onnx-s2s `
   --validate
 ```
@@ -348,7 +364,8 @@ After downloading or refreshing the Hugging Face `FlashLabs/Chroma-4B` repo unde
 ```powershell
 .venv\Scripts\python.exe scripts\rebuild_chroma_local_external_cache.py `
   --model-dir models/chroma-4b `
-  --bundle-dir onnx/chroma-s2s-full-v2 `
+  --bundle-dir onnx_deploy/chroma-s2s-full-v2 `
+  --cache-dir onnx/chroma-s2s-full-v2/ort-cache-ort-local-external `
   --provider cuda `
   --memory-profile quality-safe
 ```
@@ -367,14 +384,14 @@ onnx/chroma-s2s-full-v2/ort-cache-ort-local-external/
 
 The `model-*.safetensors` files in the cache directory should be hardlinks to `models/chroma-4b`, not separate weight copies, when both directories are on the same NTFS volume. They show their full size in directory listings but do not consume another full copy of disk space.
 
-Important: this project currently uses an optimized/local-external ONNX cache, not a serialized `.ort` model. ORT 1.27 `.ort` serialization was not reloadable for the merged external-weight Chroma graph, while the local-external ONNX cache is validated.
+Important: when using a cache, this project uses an optimized/local-external ONNX cache, not a serialized `.ort` model. ORT 1.27 `.ort` serialization was not reloadable for the merged external-weight Chroma graph, while the local-external ONNX cache is validated. Cache files are machine-local because they need safetensor hardlinks beside the cached ONNX metadata.
 
 3. Run a CUDA smoke test:
 
 ```powershell
 dotnet run --project src\ChromaOnnx -- s2s-offline `
   --model-dir models/chroma-4b `
-  --bundle-dir onnx/chroma-s2s-full-v2 `
+  --bundle-dir onnx_deploy/chroma-s2s-full-v2 `
   --prompt-text "War" `
   --prompt-audio-f32 served_runs/compare_inputs/reference_audio_24k.f32 `
   --user-audio-f32 served_runs/compare_inputs/make_taco_16k.f32 `
@@ -385,7 +402,8 @@ dotnet run --project src\ChromaOnnx -- s2s-offline `
   --ort-memory-profile quality-safe `
   --thinker-active-frames 0 `
   --optimized-model-cache-dir onnx/chroma-s2s-full-v2/ort-cache-ort-local-external `
-  --optimized-model-cache-format onnx
+  --optimized-model-cache-format onnx `
+  --cuda-gpu-mem-limit-mb 15360
 ```
 
 ## Export Bundles
@@ -397,11 +415,11 @@ This is the current recommended bundle for the F#/ONNX S2S service:
 ```powershell
 .venv\Scripts\python.exe scripts\export_chroma_onnx.py `
   --model-dir models/chroma-4b `
-  --output-dir onnx/chroma-s2s-full-v2 `
+  --output-dir onnx_deploy/chroma-s2s-full-v2 `
   --bundle safetensor-shared-s2s `
   --device cuda `
   --dtype float32 `
-  --thinker-active-frames 0 `
+  --thinker-active-frames 1 `
   --single-onnx-s2s `
   --validate
 ```
@@ -409,12 +427,12 @@ This is the current recommended bundle for the F#/ONNX S2S service:
 Expected output:
 
 ```text
-onnx/chroma-s2s-full-v2/
+onnx_deploy/chroma-s2s-full-v2/
   chroma_s2s_merged.weights_free.onnx
   shared_weights_manifest.json
 ```
 
-With ORT 1.27, also build the local-external optimized ONNX cache shown in the previous section. It avoids ORT external-data path validation failures by placing hardlinks to the safetensor shards beside the cached ONNX metadata file.
+For repeated production-style runs, also build the local-external optimized ONNX cache shown in the previous section and configure the service or CLI to use it. It avoids ORT external-data path validation failures by placing hardlinks to the safetensor shards beside the cached ONNX metadata file.
 
 For a simplified visual overview of the merged dispatcher, split logical graphs, and original-vs-optimized ONNX shape, see [diagrams/onnx_s2s_simplified.md](diagrams/onnx_s2s_simplified.md).
 
@@ -485,7 +503,7 @@ Override defaults with `appsettings.json`, `appsettings.Development.json`, or en
 
 ```powershell
 $env:ChromaOnnx__S2s__ModelDir = "E:\models\chroma-4b"
-$env:ChromaOnnx__S2s__BundleDir = "E:\onnx\chroma-s2s-full-v2"
+$env:ChromaOnnx__S2s__BundleDir = "E:\repo\Chroma_ONNX\onnx_deploy\chroma-s2s-full-v2"
 $env:ChromaOnnx__S2s__ExecutionProvider = "cuda"
 dotnet run --project src\ChromaOnnx.Service --urls http://localhost:5055
 ```
@@ -496,10 +514,12 @@ The browser lab defaults its reference text and reference audio to `assets/south
 
 On 16 GB CUDA cards, the standalone service defaults `CudaGpuMemLimitMb` to `15360` and `StreamMinFreeVramMb` to `2048` to leave VRAM headroom while still giving ORT enough arena space for large prefill allocations. Override those values with `ChromaOnnx__S2s__CudaGpuMemLimitMb` and `ChromaOnnx__S2s__StreamMinFreeVramMb` if your card has more or less VRAM.
 
+The standalone service defaults to non-deterministic sampling because it is not used for parity checks: `GenerationMode=sample`, `SamplingTemperature=0.8`, `SamplingTopP=0.95`, and `SamplingTopK=50`. Set `ChromaOnnx__S2s__GenerationMode=greedy` when you want deterministic argmax output for debugging.
+
 API shape:
 
 - `GET /` serves the S2S browser lab.
-- `GET /api/status` returns bundle readiness, memory mode, queue state, loaded ORT sessions, initializer counts, and thinker feature mode.
+- `GET /api/status` returns bundle readiness, memory mode, generation sampling settings, queue state, loaded ORT sessions, initializer counts, and thinker feature mode.
 - `POST /api/s2s/sessions` creates a session.
 - `GET /ws/s2s/{sessionId}` accepts 16 kHz Float32 PCM turn chunks and returns queue, frame, and streaming audio events.
 - `GET /api/s2s/sessions/{id}/{backend}/audio.wav` returns generated WAV.
@@ -509,7 +529,7 @@ ChromaS2SONNX queues generation FIFO and runs one F#/ONNX audio-processing job a
 
 The browser lab asks for max response seconds and converts that to Chroma audio frames at roughly 12.5 frames per second. If a run reports `stopReason: "max_frames"` or `truncatedByMaxFrames: true`, increase the response seconds; EOS means the model completed naturally.
 
-The service also has a repeated-codec-frame guard for degenerate outputs that turn into near-silent repeated audio before EOS. `--codec-stall-guard-frames 16` stops after 16 repeated generated codec frames once at least 50 frames have been produced; use `0` to disable it. These runs report `stopReason: "codec_stall"` and include `stalledByCodecPattern` plus stall timing fields in details.
+The service also has a decoded-silence guard for degenerate outputs that turn into near-silent audio before EOS. By default it stops once decoded audio remains below the RMS silence threshold for about 1 second; set `ChromaOnnx__S2s__CodecStallGuardFrames=0` to disable it in the standalone service. These runs report `stopReason: "codec_stall"` and include `stalledByDecodedSilence` plus `decodedSilence*` timing fields in details.
 
 Important WebSocket events:
 
@@ -531,7 +551,7 @@ Run F#/ONNX offline:
 ```powershell
 dotnet run --project src\ChromaOnnx -- s2s-offline `
   --model-dir models/chroma-4b `
-  --bundle-dir onnx/chroma-s2s-full-v2 `
+  --bundle-dir onnx_deploy/chroma-s2s-full-v2 `
   --prompt-text "War" `
   --prompt-audio-f32 served_runs/compare_inputs/reference_audio_24k.f32 `
   --user-audio-f32 served_runs/compare_inputs/make_taco_16k.f32 `
@@ -542,7 +562,8 @@ dotnet run --project src\ChromaOnnx -- s2s-offline `
   --ort-memory-profile quality-safe `
   --thinker-active-frames 0 `
   --optimized-model-cache-dir onnx/chroma-s2s-full-v2/ort-cache-ort-local-external `
-  --optimized-model-cache-format onnx
+  --optimized-model-cache-format onnx `
+  --cuda-gpu-mem-limit-mb 15360
 ```
 
 Run step-by-step Python/F#/ONNX parity:
@@ -550,7 +571,7 @@ Run step-by-step Python/F#/ONNX parity:
 ```powershell
 dotnet run --project src\ChromaOnnx -- s2s-compare `
   --model-dir models/chroma-4b `
-  --bundle-dir onnx/chroma-s2s-full-v2 `
+  --bundle-dir onnx_deploy/chroma-s2s-full-v2 `
   --prompt-text "War" `
   --prompt-audio served_runs/compare_inputs/reference_audio_24k.wav `
   --user-audio served_runs/compare_inputs/make_taco_16k.wav `
@@ -562,7 +583,8 @@ dotnet run --project src\ChromaOnnx -- s2s-compare `
   --frames 32 `
   --thinker-active-frames 0 `
   --optimized-model-cache-dir onnx/chroma-s2s-full-v2/ort-cache-ort-local-external `
-  --optimized-model-cache-format onnx
+  --optimized-model-cache-format onnx `
+  --cuda-gpu-mem-limit-mb 15360
 ```
 
 Run a memory report:
@@ -570,7 +592,7 @@ Run a memory report:
 ```powershell
 dotnet run --project src\ChromaOnnx -- s2s-memory-report `
   --model-dir models/chroma-4b `
-  --bundle-dir onnx/chroma-s2s-full-v2 `
+  --bundle-dir onnx_deploy/chroma-s2s-full-v2 `
   --prompt-text "War" `
   --prompt-audio-f32 served_runs/compare_inputs/reference_audio_24k.f32 `
   --user-audio-f32 served_runs/compare_inputs/make_taco_16k.f32 `
@@ -582,7 +604,8 @@ dotnet run --project src\ChromaOnnx -- s2s-memory-report `
   --ort-memory-profile quality-safe `
   --thinker-active-frames 0 `
   --optimized-model-cache-dir onnx/chroma-s2s-full-v2/ort-cache-ort-local-external `
-  --optimized-model-cache-format onnx
+  --optimized-model-cache-format onnx `
+  --cuda-gpu-mem-limit-mb 15360
 ```
 
 ## Memory Modes

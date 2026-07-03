@@ -13,6 +13,10 @@ __pycache__/
 # Local model conversion artifacts.
 models/
 onnx/
+onnx_deploy/**/ort-cache*/
+onnx_deploy/**/*.ort
+onnx_deploy/**/*.safetensors
+onnx_deploy/**/tensorrt-engines/
 sample_inputs/
 sample_outputs/
 served_runs/

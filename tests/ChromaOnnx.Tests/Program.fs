@@ -195,6 +195,10 @@ module Program =
                   StreamDecodeFrames = 4
                   StreamMinFreeVramMb = 0
                   CodecStallGuardFrames = 0
+                  GenerationMode = "greedy"
+                  SamplingTemperature = 1.0
+                  SamplingTopP = 1.0
+                  SamplingTopK = 0
                   MaxPromptAudioSeconds = 60.0
                   MaxTurnAudioSeconds = 60.0
                   GlobalGpuMemory = None
@@ -422,14 +426,25 @@ module Program =
     let private configDefaultsAndBinding () =
         let defaults = S2sRuntimeOptions()
         assertEqual "default model dir" "models/chroma-4b" defaults.ModelDir
-        assertEqual "default bundle dir" "onnx/chroma-s2s-full-v2" defaults.BundleDir
+        assertEqual "default bundle dir" "onnx_deploy/chroma-s2s-full-v2" defaults.BundleDir
+        assertEqual "default optimized cache dir" "onnx/chroma-s2s-full-v2/ort-cache-ort-local-external" defaults.OptimizedModelCacheDir
+        assertEqual "default cuda memory cap enabled" true defaults.CudaGpuMemLimitMb.HasValue
+        assertEqual "default cuda memory cap" 15360 defaults.CudaGpuMemLimitMb.Value
         assertEqual "default stream frames" 4 defaults.StreamDecodeFrames
+        assertEqual "default generation mode" "sample" defaults.GenerationMode
+        assertEqual "default sampling temperature" 0.8 defaults.SamplingTemperature
+        assertEqual "default sampling top p" 0.95 defaults.SamplingTopP
+        assertEqual "default sampling top k" 50 defaults.SamplingTopK
         assertEqual "default max queue" 32 defaults.MaxQueueLength
 
         let values = Dictionary<string, string>()
         values["ChromaOnnx:S2s:ModelDir"] <- "models/custom"
         values["ChromaOnnx:S2s:ExecutionProvider"] <- "cpu"
         values["ChromaOnnx:S2s:MaxQueueLength"] <- "7"
+        values["ChromaOnnx:S2s:GenerationMode"] <- "greedy"
+        values["ChromaOnnx:S2s:SamplingTemperature"] <- "0.7"
+        values["ChromaOnnx:S2s:SamplingTopP"] <- "0.9"
+        values["ChromaOnnx:S2s:SamplingTopK"] <- "25"
         let configuration =
             ConfigurationBuilder()
                 .AddInMemoryCollection(values)
@@ -438,6 +453,10 @@ module Program =
         assertEqual "bound model dir" "models/custom" bound.ModelDir
         assertEqual "bound execution provider" "cpu" bound.ExecutionProvider
         assertEqual "bound max queue" 7 bound.MaxQueueLength
+        assertEqual "bound generation mode" "greedy" bound.GenerationMode
+        assertEqual "bound sampling temperature" 0.7 bound.SamplingTemperature
+        assertEqual "bound sampling top p" 0.9 bound.SamplingTopP
+        assertEqual "bound sampling top k" 25 bound.SamplingTopK
 
     let private runtimePathResolution () =
         let normalize path = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path))
@@ -445,7 +464,7 @@ module Program =
         let outputDir = Path.Combine(root, "src", "ChromaOnnx.Service", "bin", "Debug", "net10.0")
         try
             Directory.CreateDirectory(Path.Combine(root, "models", "chroma-4b")) |> ignore
-            Directory.CreateDirectory(Path.Combine(root, "onnx", "chroma-s2s-full-v2")) |> ignore
+            Directory.CreateDirectory(Path.Combine(root, "onnx_deploy", "chroma-s2s-full-v2")) |> ignore
             Directory.CreateDirectory(outputDir) |> ignore
             File.WriteAllText(Path.Combine(root, "Chroma_ONNX.slnx"), "<Solution />")
 
@@ -470,6 +489,39 @@ module Program =
             if Directory.Exists root then
                 Directory.Delete(root, true)
 
+    let private localExternalDataLinks () =
+        let root = Path.Combine(Path.GetTempPath(), $"chroma-onnx-links-{Guid.NewGuid():N}")
+        try
+            let modelDir = Path.Combine(root, "models", "chroma-4b")
+            let bundleDir = Path.Combine(root, "onnx_deploy", "chroma-s2s-full-v2")
+            Directory.CreateDirectory(modelDir) |> ignore
+            Directory.CreateDirectory(bundleDir) |> ignore
+
+            let shardName = "model-00001-of-00003.safetensors"
+            let sourcePath = Path.Combine(modelDir, shardName)
+            let targetPath = Path.Combine(bundleDir, shardName)
+            let graphPath = Path.Combine(bundleDir, "chroma_s2s_merged.weights_free.onnx")
+            File.WriteAllBytes(sourcePath, [| 1uy; 2uy; 3uy; 4uy |])
+            File.WriteAllText(graphPath, "placeholder")
+
+            let entries =
+                [| { Graph = "s2s_merged"
+                     OnnxInitializer = "initializer"
+                     SourceShard = shardName
+                     SourceTensor = "tensor"
+                     Dtype = "F32"
+                     Shape = [| 1L |]
+                     ByteLength = 4L
+                     Transform = None } |]
+
+            SharedWeights.ensureLocalExternalDataLinks modelDir graphPath entries
+
+            assertEqual "external-data link exists" true (File.Exists targetPath)
+            assertEqual "external-data link size" (FileInfo(sourcePath).Length) (FileInfo(targetPath).Length)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+
     [<EntryPoint>]
     let main _ =
         fifoOrdering ()
@@ -479,6 +531,7 @@ module Program =
         float32ChunkRoundtrip ()
         configDefaultsAndBinding ()
         runtimePathResolution ()
+        localExternalDataLinks ()
         serviceRejectsPythonBackend ()
         serviceWebSocketAndArtifacts ()
         printfn "All Chroma ONNX tests passed."

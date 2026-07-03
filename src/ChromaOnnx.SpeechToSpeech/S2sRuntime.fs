@@ -23,7 +23,7 @@ type private RuntimeSession =
       WorkDir: string
       mutable LastDetails: JsonElement option }
 
-type private RuntimeSessionStore(workDir: string, promptSampleRate: int) =
+type private RuntimeSessionStore(workDir: string, promptSampleRate: int, runtimeMode: string) =
     let sessions = ConcurrentDictionary<string, RuntimeSession>(StringComparer.Ordinal)
 
     let newId () =
@@ -34,7 +34,7 @@ type private RuntimeSessionStore(workDir: string, promptSampleRate: int) =
     let toInfo (session: RuntimeSession) =
         { Id = session.Id
           ServiceName = "ChromaS2SONNX"
-          Mode = "s2s_greedy_streaming"
+          Mode = runtimeMode
           Backend = session.Backend
           PromptText = session.PromptText
           SystemPrompt = session.SystemPrompt
@@ -87,6 +87,38 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
     let streamDecodeFrames = max 1 options.StreamDecodeFrames
     let streamMinFreeVramMb = max 0 options.StreamMinFreeVramMb
     let codecStallGuardFrames = max 0 options.CodecStallGuardFrames
+    let generationMode =
+        let text = options.GenerationMode.Trim().ToLowerInvariant()
+        match text with
+        | "" | "sample" | "sampling" | "nondeterministic" | "non-deterministic" -> "sample"
+        | "greedy" | "deterministic" | "argmax" -> "greedy"
+        | other ->
+            invalidArg
+                "GenerationMode"
+                $"Unsupported generation mode '{other}'. Use 'sample' or 'greedy'."
+    let finiteOr fallback value =
+        if Double.IsNaN value || Double.IsInfinity value then
+            fallback
+        else
+            value
+    let samplingTemperature = Math.Max(0.01, finiteOr 0.8 options.SamplingTemperature)
+    let samplingTopP = Math.Min(1.0, Math.Max(0.01, finiteOr 0.95 options.SamplingTopP))
+    let samplingTopK = max 0 options.SamplingTopK
+    let samplingOptions =
+        { Enabled = generationMode = "sample"
+          Temperature = samplingTemperature
+          TopP = samplingTopP
+          TopK = samplingTopK }
+    let runtimeMode =
+        if samplingOptions.Enabled then
+            "s2s_sampling_streaming"
+        else
+            "s2s_greedy_streaming"
+    let backendMode =
+        if samplingOptions.Enabled then
+            "s2s_sampling"
+        else
+            "s2s_greedy"
     let maxQueueLength = max 0 options.MaxQueueLength
     let maxPromptAudioSeconds = Math.Max(0.1, options.MaxPromptAudioSeconds)
     let maxTurnAudioSeconds = Math.Max(0.1, options.MaxTurnAudioSeconds)
@@ -107,7 +139,7 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
           CudaGpuMemLimitMb = cudaGpuMemLimitMb }
     let processor = ChromaNativeProcessor(modelDir, options.ThinkerActiveFrames)
     let runner = new ChromaS2sOnnxRunner(modelDir, bundleDir, options.ExecutionProvider, options.MemoryMode, tuningOptions)
-    let store = RuntimeSessionStore(workDir, processor.PromptSampleRate)
+    let store = RuntimeSessionStore(workDir, processor.PromptSampleRate, runtimeMode)
     let workQueue = StreamingWorkQueue(maxQueueLength)
     let maxPromptAudioSamples = int (Math.Ceiling(maxPromptAudioSeconds * float processor.PromptSampleRate))
     let maxTurnAudioSamples = int (Math.Ceiling(maxTurnAudioSeconds * float processor.ThinkerSampleRate))
@@ -168,7 +200,8 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
                 onAudioChunk,
                 cancellationToken,
                 ?shouldDecodeChunk = Some shouldDecodeChunk,
-                ?codecStallGuardFrames = Some codecStallGuardFrames
+                ?codecStallGuardFrames = Some codecStallGuardFrames,
+                ?samplingOptions = Some samplingOptions
             )
         let memoryAfter = RuntimeMemory.current()
         let codesPath = Path.Combine(backendDir, "audio_codes.i64")
@@ -188,7 +221,12 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
             {| id = session.Id
                backend = backend
                label = backendLabel backend
-               mode = "s2s_greedy"
+               mode = backendMode
+               generationMode = generationMode
+               samplingEnabled = samplingOptions.Enabled
+               samplingTemperature = samplingOptions.Temperature
+               samplingTopP = samplingOptions.TopP
+               samplingTopK = samplingOptions.TopK
                audioUrl = audioUrl
                detailsUrl = detailsUrl
                executionProvider = runner.Status.ExecutionProvider
@@ -256,7 +294,7 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
             let status = runner.Status
             { Ready = status.Ready
               ServiceName = "ChromaS2SONNX"
-              Mode = "s2s_greedy_streaming"
+              Mode = runtimeMode
               PythonInRequestPath = false
               ModelDir = modelDir
               BundleDir = bundleDir
@@ -277,6 +315,10 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
               StreamDecodeFrames = streamDecodeFrames
               StreamMinFreeVramMb = streamMinFreeVramMb
               CodecStallGuardFrames = codecStallGuardFrames
+              GenerationMode = generationMode
+              SamplingTemperature = samplingOptions.Temperature
+              SamplingTopP = samplingOptions.TopP
+              SamplingTopK = samplingOptions.TopK
               MaxPromptAudioSeconds = maxPromptAudioSeconds
               MaxTurnAudioSeconds = maxTurnAudioSeconds
               GlobalGpuMemory = RuntimeMemory.tryGlobalGpuMemory()
@@ -401,7 +443,12 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
                                 let details =
                                     {| id = session.Id
                                        requestId = requestId
-                                       mode = "s2s_greedy_streaming"
+                                       mode = runtimeMode
+                                       generationMode = generationMode
+                                       samplingEnabled = samplingOptions.Enabled
+                                       samplingTemperature = samplingOptions.Temperature
+                                       samplingTopP = samplingOptions.TopP
+                                       samplingTopK = samplingOptions.TopK
                                        backend = session.Backend
                                        maxNewFrames = session.MaxNewFrames
                                        streamDecodeFrames = streamDecodeFrames

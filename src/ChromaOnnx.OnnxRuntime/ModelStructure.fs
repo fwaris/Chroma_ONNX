@@ -187,6 +187,17 @@ type S2sGenerationResult =
             for buffer in this.OwnedBuffers do
                 buffer.Dispose()
 
+type S2sSamplingOptions =
+    { Enabled: bool
+      Temperature: float
+      TopP: float
+      TopK: int }
+    static member Greedy =
+        { Enabled = false
+          Temperature = 1.0
+          TopP = 1.0
+          TopK = 0 }
+
 type S2sGeneratedFrame =
     { FrameIndex: int
       StepKind: string

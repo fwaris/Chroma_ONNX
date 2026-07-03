@@ -776,6 +776,7 @@ module S2sServe =
                generationFrameRateFps = generationFrameRateFps
                stopReason = result.StopReason
                truncatedByMaxFrames = truncatedByMaxFrames
+               stalledByDecodedSilence = result.StopReason = "codec_stall"
                stalledByCodecPattern = result.StopReason = "codec_stall"
                truncationWarning =
                    if truncatedByMaxFrames then
@@ -784,7 +785,7 @@ module S2sServe =
                        ""
                stallWarning =
                    if result.StopReason = "codec_stall" then
-                       $"Generation stopped after {codecStallGuardFrames} consecutive repeated codec frames, which usually indicates repeated near-silence."
+                       "Generation stopped after decoded audio stayed below the RMS silence threshold for about 1 second."
                    else
                        ""
                stepKinds = result.StepKinds

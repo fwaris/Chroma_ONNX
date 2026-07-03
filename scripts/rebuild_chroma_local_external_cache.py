@@ -17,13 +17,13 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--model-dir", default="models/chroma-4b")
-    parser.add_argument("--bundle-dir", default="onnx/chroma-s2s-full-v2")
+    parser.add_argument("--bundle-dir", default="onnx_deploy/chroma-s2s-full-v2")
     parser.add_argument(
         "--cache-dir",
         default=None,
         help=(
             "Output cache directory. Defaults to "
-            "<bundle-dir>/ort-cache-ort-local-external."
+            "onnx/<bundle-name>/ort-cache-ort-local-external."
         ),
     )
     parser.add_argument("--graph", default="s2s_merged")
@@ -66,7 +66,8 @@ def main() -> int:
 
     model_dir = Path(args.model_dir).resolve()
     bundle_dir = Path(args.bundle_dir).resolve()
-    cache_dir = Path(args.cache_dir).resolve() if args.cache_dir else bundle_dir / "ort-cache-ort-local-external"
+    default_cache_dir = Path("onnx") / bundle_dir.name / "ort-cache-ort-local-external"
+    cache_dir = Path(args.cache_dir).resolve() if args.cache_dir else default_cache_dir.resolve()
     manifest_path = bundle_dir / "shared_weights_manifest.json"
 
     if not manifest_path.is_file():

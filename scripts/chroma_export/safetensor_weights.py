@@ -223,7 +223,10 @@ def point_tensor_to_safetensor_data(
     tensor.ClearField("string_data")
     del tensor.external_data[:]
     tensor.data_location = onnx.TensorProto.EXTERNAL
-    location = external_data_location(source_shard_path, output_path)
+    # ONNX Runtime validates external_data locations before supplied shared
+    # initializers are registered. Keep locations inside the graph directory;
+    # the F# runtime creates ignored local hardlinks to the configured model dir.
+    location = source_shard_path.name
     for key, value in (
         ("location", location),
         ("offset", str(source_offset)),
@@ -1087,8 +1090,19 @@ def validate_shared_onnxruntime(shared_manifest: dict, model_dir: Path, validati
         dtypes = sorted({str(entry["dtype"]) for entry in graph_entries})
         print(f"Python ORT shared validation for {graph_name} uses safetensors external-data spans ({dtypes}).")
 
-        session_options = ort.SessionOptions()
-        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-        session = ort.InferenceSession(str(path), sess_options=session_options, providers=["CPUExecutionProvider"])
-        outputs = session.run(None, validation_inputs[graph_name])
-        print(f"ONNX Runtime shared {graph_name} outputs: {[str(output.shape) for output in outputs]}")
+        created_links: list[Path] = []
+        try:
+            for source_shard in sorted({str(entry["source_shard"]) for entry in graph_entries}):
+                target_path = path.parent / source_shard
+                if not target_path.exists():
+                    ensure_hardlinked_safetensor(model_dir / source_shard, path.parent)
+                    created_links.append(target_path)
+
+            session_options = ort.SessionOptions()
+            session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+            session = ort.InferenceSession(str(path), sess_options=session_options, providers=["CPUExecutionProvider"])
+            outputs = session.run(None, validation_inputs[graph_name])
+            print(f"ONNX Runtime shared {graph_name} outputs: {[str(output.shape) for output in outputs]}")
+        finally:
+            for target_path in created_links:
+                target_path.unlink(missing_ok=True)
