@@ -42,8 +42,9 @@ module S2sWebApp =
     textarea { min-height: 82px; resize: vertical; }
     button { border: 0; border-radius: 6px; padding: 10px 13px; background: var(--accent); color: white; font-weight: 750; cursor: pointer; }
     button:disabled { opacity: .6; cursor: wait; }
+    button.secondary { background: #344054; }
     button.danger { background: var(--danger); }
-    .actions { display: grid; grid-template-columns: 1fr auto; gap: 10px; }
+    .actions { display: grid; grid-template-columns: 1fr auto auto; gap: 10px; }
     section { padding: 18px 24px; display: grid; gap: 14px; align-content: start; }
     .status { border: 1px solid var(--line); border-radius: 8px; padding: 12px; color: var(--muted); background: white; }
     .bad { color: var(--danger); }
@@ -77,6 +78,7 @@ module S2sWebApp =
       <label>Max response seconds<input id="maxResponseSeconds" type="number" min="1" max="24" step="0.5" value="12"></label>
       <div class="actions">
         <button id="sendButton" type="submit">Send</button>
+        <button id="newSessionButton" class="secondary" type="button">New</button>
         <button id="cancelButton" class="danger" type="button" disabled>Cancel</button>
       </div>
     </form>
@@ -95,6 +97,7 @@ module S2sWebApp =
     const runtime = document.getElementById('runtime');
     const form = document.getElementById('sessionForm');
     const button = document.getElementById('sendButton');
+    const newSessionButton = document.getElementById('newSessionButton');
     const cancelButton = document.getElementById('cancelButton');
     const message = document.getElementById('message');
     const details = document.getElementById('details');
@@ -109,6 +112,10 @@ module S2sWebApp =
     let playbackContext = null;
     let playbackCursor = 0;
     let currentSocket = null;
+    let currentSession = null;
+    let socketReadyResolve = null;
+    let socketReadyReject = null;
+    let socketReadyPromise = null;
     let activeMicStop = null;
     let pendingChunk = null;
     let streamedSamples = 0;
@@ -251,11 +258,15 @@ module S2sWebApp =
     }
 
     function showResult(result) {
-      audioResults.innerHTML = '';
+      const block = document.createElement('div');
+      block.className = 'audioResult';
+      const title = document.createElement('strong');
+      title.textContent = `Turn ${result.turnIndex || '?'}`;
       const audio = document.createElement('audio');
       audio.controls = true;
       audio.src = cacheBust(result.audioUrl);
-      audioResults.append(audio);
+      block.append(title, audio);
+      audioResults.append(block);
     }
 
     function updateFromEvent(payload) {
@@ -277,7 +288,7 @@ module S2sWebApp =
           message.textContent = 'Audio decode deferred';
           break;
         case 'generation.done':
-          message.textContent = 'Done';
+          message.textContent = `Done: turn ${payload.turnIndex || ''}`;
           showResult(payload);
           setBusy(false);
           break;
@@ -301,82 +312,107 @@ module S2sWebApp =
       }
     }
 
+    function closeConversationSocket(reason = 'new conversation') {
+      if (activeMicStop) activeMicStop();
+      if (currentSocket && currentSocket.readyState === WebSocket.OPEN) currentSocket.close(1000, reason);
+      currentSocket = null;
+      socketReadyPromise = null;
+      socketReadyResolve = null;
+      socketReadyReject = null;
+    }
+
+    async function createSession(promptBytes, maxSeconds) {
+      const formData = new FormData();
+      formData.set('systemPrompt', document.getElementById('systemPrompt').value);
+      formData.set('promptText', document.getElementById('promptText').value);
+      formData.set('backend', 'fsharp_onnx');
+      formData.set('maxNewFrames', String(Math.max(1, Math.ceil(maxSeconds / 0.08))));
+      formData.set('promptPcm24k', new Blob([promptBytes], { type: 'application/octet-stream' }), 'prompt.f32');
+      const sessionResponse = await fetch('/api/s2s/sessions', { method: 'POST', body: formData });
+      const session = await sessionResponse.json();
+      if (!sessionResponse.ok) throw new Error(session.error || 'Failed to create session.');
+      currentSession = session;
+      return session;
+    }
+
+    async function ensureSocket(session) {
+      if (currentSocket && currentSocket.readyState === WebSocket.OPEN && socketReadyPromise) {
+        await socketReadyPromise;
+        return currentSocket;
+      }
+
+      const ws = new WebSocket(`${location.origin.replace('http', 'ws')}${session.websocketUrl}`);
+      currentSocket = ws;
+      ws.binaryType = 'arraybuffer';
+      socketReadyPromise = new Promise((resolve, reject) => {
+        socketReadyResolve = resolve;
+        socketReadyReject = reject;
+      });
+      ws.onmessage = async event => {
+        if (typeof event.data === 'string') {
+          const payload = JSON.parse(event.data);
+          if (payload.type === 'session.ready' && socketReadyResolve) {
+            socketReadyResolve(ws);
+            socketReadyResolve = null;
+            socketReadyReject = null;
+          }
+          if (payload.type === 'audio.chunk') pendingChunk = payload;
+          updateFromEvent(payload);
+          return;
+        }
+        if (pendingChunk) {
+          const chunk = pendingChunk;
+          pendingChunk = null;
+          const samples = new Float32Array(event.data);
+          streamedSamples += samples.length;
+          streamMetric.textContent = `${(streamedSamples / (chunk.sampleRate || 24000)).toFixed(2)} s`;
+          await playFloat32Chunk(samples, chunk.sampleRate || 24000);
+        }
+      };
+      ws.onerror = () => {
+        message.textContent = 'WebSocket error while generating.';
+        message.classList.add('bad');
+        setBusy(false);
+        if (socketReadyReject) socketReadyReject(new Error('WebSocket error while opening session.'));
+      };
+      ws.onclose = () => {
+        currentSocket = null;
+        socketReadyPromise = null;
+        if (activeMicStop) activeMicStop();
+        if (button.disabled) setBusy(false);
+      };
+      await socketReadyPromise;
+      return ws;
+    }
+
     form.addEventListener('submit', async event => {
       event.preventDefault();
-      if (currentSocket && currentSocket.readyState === WebSocket.OPEN) currentSocket.close(1000, 'new request');
       setBusy(true);
       message.classList.remove('bad');
       message.textContent = 'Preparing audio';
-      audioResults.innerHTML = '';
       details.textContent = '{}';
       streamedSamples = 0;
       playbackCursor = 0;
 
       try {
         const mode = inputMode.value;
-        const promptBytes = await readReferenceAudioAsF32(24000);
         const turnFile = document.getElementById('turnPcm').files[0];
         if (mode === 'file' && !turnFile) throw new Error('Turn audio is required in file mode.');
         const turnBytes = mode === 'file' ? await readAudioAsF32(turnFile, 16000) : null;
         const maxSeconds = Number(document.getElementById('maxResponseSeconds').value || 12);
-        const formData = new FormData();
-        formData.set('systemPrompt', document.getElementById('systemPrompt').value);
-        formData.set('promptText', document.getElementById('promptText').value);
-        formData.set('backend', 'fsharp_onnx');
-        formData.set('maxNewFrames', String(Math.max(1, Math.ceil(maxSeconds / 0.08))));
-        formData.set('promptPcm24k', new Blob([promptBytes], { type: 'application/octet-stream' }), 'prompt.f32');
-        const sessionResponse = await fetch('/api/s2s/sessions', { method: 'POST', body: formData });
-        const session = await sessionResponse.json();
-        if (!sessionResponse.ok) throw new Error(session.error || 'Failed to create session.');
+        const session = currentSession || await createSession(await readReferenceAudioAsF32(24000), maxSeconds);
 
         message.textContent = mode === 'mic' ? 'Opening microphone' : 'Opening WebSocket';
-        const ws = new WebSocket(`${location.origin.replace('http', 'ws')}${session.websocketUrl}`);
-        currentSocket = ws;
-        ws.binaryType = 'arraybuffer';
-        ws.onopen = async () => {
-          try {
-            ws.send(JSON.stringify({ type: 'turn.start' }));
-            if (mode === 'mic') {
-              const seconds = Number(document.getElementById('micSeconds').value) || 6;
-              message.textContent = `Recording microphone for ${Math.max(1, seconds)} s`;
-              await streamMicrophone(ws, seconds);
-            } else {
-              await sendBytesInChunks(ws, turnBytes);
-              ws.send(JSON.stringify({ type: 'turn.end' }));
-            }
-          } catch (error) {
-            message.textContent = error.message;
-            message.classList.add('bad');
-            setBusy(false);
-            if (ws.readyState === WebSocket.OPEN) ws.close(1011, error.message);
-          }
-        };
-        ws.onmessage = async event => {
-          if (typeof event.data === 'string') {
-            const payload = JSON.parse(event.data);
-            if (payload.type === 'audio.chunk') pendingChunk = payload;
-            updateFromEvent(payload);
-            return;
-          }
-          if (pendingChunk) {
-            const chunk = pendingChunk;
-            pendingChunk = null;
-            const samples = new Float32Array(event.data);
-            streamedSamples += samples.length;
-            streamMetric.textContent = `${(streamedSamples / (chunk.sampleRate || 24000)).toFixed(2)} s`;
-            await playFloat32Chunk(samples, chunk.sampleRate || 24000);
-          }
-        };
-        ws.onerror = () => {
-          message.textContent = 'WebSocket error while generating.';
-          message.classList.add('bad');
-          setBusy(false);
-        };
-        ws.onclose = () => {
-          currentSocket = null;
-          if (activeMicStop) activeMicStop();
-          if (button.disabled) setBusy(false);
-        };
+        const ws = await ensureSocket(session);
+        ws.send(JSON.stringify({ type: 'turn.start' }));
+        if (mode === 'mic') {
+          const seconds = Number(document.getElementById('micSeconds').value) || 6;
+          message.textContent = `Recording microphone for ${Math.max(1, seconds)} s`;
+          await streamMicrophone(ws, seconds);
+        } else {
+          await sendBytesInChunks(ws, turnBytes);
+          ws.send(JSON.stringify({ type: 'turn.end' }));
+        }
       } catch (error) {
         message.textContent = error.message;
         message.classList.add('bad');
@@ -388,9 +424,17 @@ module S2sWebApp =
       if (activeMicStop) activeMicStop();
       if (currentSocket && currentSocket.readyState === WebSocket.OPEN) {
         currentSocket.send(JSON.stringify({ type: 'turn.cancel' }));
-        currentSocket.close(1000, 'canceled');
       }
       setBusy(false);
+    });
+
+    newSessionButton.addEventListener('click', () => {
+      closeConversationSocket();
+      currentSession = null;
+      audioResults.innerHTML = '';
+      details.textContent = '{}';
+      message.classList.remove('bad');
+      message.textContent = 'Idle';
     });
 
     inputMode.addEventListener('change', updateMode);
@@ -536,6 +580,9 @@ module S2sWebApp =
            samplingTopK = status.SamplingTopK
            maxPromptAudioSeconds = status.MaxPromptAudioSeconds
            maxTurnAudioSeconds = status.MaxTurnAudioSeconds
+           maxHistoryTurns = status.MaxHistoryTurns
+           maxHistoryAudioSeconds = status.MaxHistoryAudioSeconds
+           includeAssistantAudioInHistory = status.IncludeAssistantAudioInHistory
            globalGpuMemory = optionToObj status.GlobalGpuMemory
            peakPrivateGb = status.PeakPrivateGb
            peakWorkingSetGb = status.PeakWorkingSetGb
@@ -642,6 +689,9 @@ module S2sWebApp =
                                samplingTemperature = runtimeStatus.SamplingTemperature
                                samplingTopP = runtimeStatus.SamplingTopP
                                samplingTopK = runtimeStatus.SamplingTopK
+                               maxHistoryTurns = runtimeStatus.MaxHistoryTurns
+                               maxHistoryAudioSeconds = runtimeStatus.MaxHistoryAudioSeconds
+                               includeAssistantAudioInHistory = runtimeStatus.IncludeAssistantAudioInHistory
                                cudaGpuMemLimitMb = runtimeStatus.CudaGpuMemLimitMb
                                queueLength = runtimeStatus.QueueLength
                                maxQueueLength = runtimeStatus.MaxQueueLength |}
@@ -719,12 +769,16 @@ module S2sWebApp =
                                                                id = session.Id
                                                                requestId = requestId
                                                                queueLength = queueLength |}
-                                                | GenerationStarted(requestId, maxNewFrames, streamDecodeFrames, streamMinFreeVramMb, codecStallGuardFrames) ->
+                                                | GenerationStarted(requestId, maxNewFrames, streamDecodeFrames, streamMinFreeVramMb, codecStallGuardFrames, context) ->
                                                     do!
                                                         sendJsonLocked
                                                             {| ``type`` = "generation.started"
                                                                id = session.Id
                                                                requestId = requestId
+                                                               turnIndex = context.TurnIndex
+                                                               historyTurnsUsed = context.HistoryTurnsUsed
+                                                               historyAudioSeconds = context.HistoryAudioSeconds
+                                                               historyDropped = context.HistoryDropped
                                                                backend = session.Backend
                                                                backends = [| "fsharp_onnx" |]
                                                                maxNewFrames = maxNewFrames
@@ -775,6 +829,10 @@ module S2sWebApp =
                                                             {| ``type`` = "generation.done"
                                                                id = result.Id
                                                                requestId = result.RequestId
+                                                               turnIndex = result.TurnIndex
+                                                               historyTurnsUsed = result.HistoryTurnsUsed
+                                                               historyAudioSeconds = result.HistoryAudioSeconds
+                                                               historyDropped = result.HistoryDropped
                                                                backend = result.Backend
                                                                audioUrl = result.AudioUrl
                                                                detailsUrl = result.DetailsUrl
@@ -796,7 +854,7 @@ module S2sWebApp =
                                                     emit,
                                                     socketCancellation.Token
                                                 )
-                                            running <- false
+                                            turnAudio.SetLength(0L)
                                         with
                                         | :? OperationCanceledException ->
                                             running <- false
@@ -828,6 +886,23 @@ module S2sWebApp =
                     do! ctx.Response.SendFileAsync(artifact.Path)
         }
 
+    let private serveTurnArtifact (runtime: IS2sRuntime) backend fileName (ctx: HttpContext) =
+        task {
+            let sessionId = routeValue ctx "id"
+            let turnIndexText = routeValue ctx "turnIndex"
+            match Int32.TryParse(turnIndexText) with
+            | false, _ -> do! writeJson ctx 400 (error 400 "Invalid turn index.")
+            | true, turnIndex ->
+                if not (safeId sessionId) || turnIndex < 1 then
+                    do! writeJson ctx 400 (error 400 "Invalid session id or turn index.")
+                else
+                    match runtime.TryGetTurnArtifact(sessionId, turnIndex, backend, fileName) with
+                    | None -> do! writeJson ctx 404 (error 404 $"Session turn artifact {fileName} was not found.")
+                    | Some artifact ->
+                        ctx.Response.ContentType <- artifact.ContentType
+                        do! ctx.Response.SendFileAsync(artifact.Path)
+        }
+
     let map (app: WebApplication) (runtime: IS2sRuntime) =
         app.UseWebSockets() |> ignore
         app.MapGet("/", RequestDelegate(fun ctx -> task { do! writeText ctx "text/html; charset=utf-8" indexHtml })) |> ignore
@@ -837,6 +912,9 @@ module S2sWebApp =
         app.MapGet("/api/status", RequestDelegate(fun ctx -> writeJson ctx 200 (statusPayload runtime))) |> ignore
         app.MapPost("/api/s2s/sessions", RequestDelegate(fun ctx -> createSession runtime ctx)) |> ignore
         app.MapGet("/ws/s2s/{id}", RequestDelegate(fun ctx -> handleSocket runtime ctx)) |> ignore
+        app.MapGet("/api/s2s/sessions/{id}/turns/{turnIndex}/details.json", RequestDelegate(fun ctx -> serveTurnArtifact runtime None "details.json" ctx)) |> ignore
+        app.MapGet("/api/s2s/sessions/{id}/turns/{turnIndex}/{backend}/details.json", RequestDelegate(fun ctx -> serveTurnArtifact runtime (Some(routeValue ctx "backend")) "details.json" ctx)) |> ignore
+        app.MapGet("/api/s2s/sessions/{id}/turns/{turnIndex}/{backend}/audio.wav", RequestDelegate(fun ctx -> serveTurnArtifact runtime (Some(routeValue ctx "backend")) "audio.wav" ctx)) |> ignore
         app.MapGet("/api/s2s/sessions/{id}/details.json", RequestDelegate(fun ctx -> serveArtifact runtime None "details.json" ctx)) |> ignore
         app.MapGet("/api/s2s/sessions/{id}/audio.wav", RequestDelegate(fun ctx -> serveArtifact runtime None "audio.wav" ctx)) |> ignore
         app.MapGet("/api/s2s/sessions/{id}/{backend}/details.json", RequestDelegate(fun ctx -> serveArtifact runtime (Some(routeValue ctx "backend")) "details.json" ctx)) |> ignore

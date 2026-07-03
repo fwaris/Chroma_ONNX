@@ -152,19 +152,29 @@ module Program =
 
     type private FakeRuntime(workDir: string) =
         let sessions = ConcurrentDictionary<string, S2sSessionInfo>(StringComparer.Ordinal)
+        let turnIndexes = ConcurrentDictionary<string, int>(StringComparer.Ordinal)
 
         let sessionDir id =
             Path.Combine(workDir, "s2s", id)
 
-        let ensureArtifacts id =
+        let turnDir id (turnIndex: int) =
+            Path.Combine(sessionDir id, "turns", turnIndex.ToString("0000", Globalization.CultureInfo.InvariantCulture))
+
+        let ensureArtifacts id turnIndex =
             let dir = sessionDir id
-            let backendDir = Path.Combine(dir, "fsharp_onnx")
+            let turnRoot = turnDir id turnIndex
+            let backendDir = Path.Combine(turnRoot, "fsharp_onnx")
+            let legacyBackendDir = Path.Combine(dir, "fsharp_onnx")
             Directory.CreateDirectory(backendDir) |> ignore
-            let details = """{"backend":"fsharp_onnx","mode":"fake"}"""
+            Directory.CreateDirectory(legacyBackendDir) |> ignore
+            let details = $"""{{"backend":"fsharp_onnx","mode":"fake","turnIndex":{turnIndex}}}"""
+            File.WriteAllText(Path.Combine(turnRoot, "details.json"), details)
             File.WriteAllText(Path.Combine(dir, "details.json"), details)
             File.WriteAllText(Path.Combine(backendDir, "details.json"), details)
+            File.WriteAllText(Path.Combine(legacyBackendDir, "details.json"), details)
             File.WriteAllBytes(Path.Combine(dir, "audio.wav"), [| byte 'R'; byte 'I'; byte 'F'; byte 'F' |])
             File.WriteAllBytes(Path.Combine(backendDir, "audio.wav"), [| byte 'R'; byte 'I'; byte 'F'; byte 'F' |])
+            File.WriteAllBytes(Path.Combine(legacyBackendDir, "audio.wav"), [| byte 'R'; byte 'I'; byte 'F'; byte 'F' |])
 
         interface IS2sRuntime with
             member _.MaxPromptAudioSamples = 24000
@@ -201,6 +211,9 @@ module Program =
                   SamplingTopK = 0
                   MaxPromptAudioSeconds = 60.0
                   MaxTurnAudioSeconds = 60.0
+                  MaxHistoryTurns = 2
+                  MaxHistoryAudioSeconds = 180.0
+                  IncludeAssistantAudioInHistory = true
                   GlobalGpuMemory = None
                   PeakPrivateGb = 0.0
                   PeakWorkingSetGb = 0.0
@@ -239,6 +252,7 @@ module Program =
                       WebsocketUrl = $"/ws/s2s/{id}"
                       CreatedUtc = DateTimeOffset.UtcNow }
                 sessions[id] <- info
+                turnIndexes[id] <- 0
                 Directory.CreateDirectory(sessionDir id) |> ignore
                 info
 
@@ -254,6 +268,12 @@ module Program =
                     | false, _ -> return invalidArg "sessionId" "S2S session was not found."
                     | true, session ->
                         let requestId = request.RequestId |> Option.defaultValue $"{session.Id}_{Guid.NewGuid():N}"
+                        let turnIndex = turnIndexes.AddOrUpdate(session.Id, 1, fun _ previous -> previous + 1)
+                        let context =
+                            { TurnIndex = turnIndex
+                              HistoryTurnsUsed = max 0 (turnIndex - 1)
+                              HistoryAudioSeconds = float request.UserAudio16k.Length / 16000.0
+                              HistoryDropped = 0 }
                         let runningSnapshot =
                             { Id = requestId
                               Position = 0
@@ -262,19 +282,23 @@ module Program =
                               IsRunning = true }
                         do! emit (QueueEnqueued(requestId, runningSnapshot))
                         do! emit (QueueStarted(requestId, 0))
-                        do! emit (GenerationStarted(requestId, session.MaxNewFrames, 4, 0, 0))
+                        do! emit (GenerationStarted(requestId, session.MaxNewFrames, 4, 0, 0, context))
                         do! emit (GenerationFrame(requestId, { FrameIndex = 0; StepKind = "frame"; IsEos = false; Codes = [| 1L; 2L |] }))
                         do! emit (AudioChunk(requestId, { ChunkIndex = 0; StartFrame = 0; FrameCount = 1; StartSample = 0; SampleRate = 24000; Samples = [| 0.0f; 0.1f |] }))
-                        ensureArtifacts session.Id
-                        let details = jsonElement {| backend = "fsharp_onnx"; mode = "fake" |}
+                        ensureArtifacts session.Id turnIndex
+                        let details = jsonElement {| backend = "fsharp_onnx"; mode = "fake"; turnIndex = turnIndex |}
                         let backendResult =
                             { Backend = "fsharp_onnx"
-                              AudioUrl = $"/api/s2s/sessions/{session.Id}/fsharp_onnx/audio.wav"
-                              DetailsUrl = $"/api/s2s/sessions/{session.Id}/fsharp_onnx/details.json"
+                              AudioUrl = $"/api/s2s/sessions/{session.Id}/turns/{turnIndex}/fsharp_onnx/audio.wav"
+                              DetailsUrl = $"/api/s2s/sessions/{session.Id}/turns/{turnIndex}/fsharp_onnx/details.json"
                               Details = details }
                         let result =
                             { Id = session.Id
                               RequestId = requestId
+                              TurnIndex = turnIndex
+                              HistoryTurnsUsed = context.HistoryTurnsUsed
+                              HistoryAudioSeconds = context.HistoryAudioSeconds
+                              HistoryDropped = context.HistoryDropped
                               Backend = "fsharp_onnx"
                               AudioUrl = backendResult.AudioUrl
                               DetailsUrl = backendResult.DetailsUrl
@@ -288,6 +312,22 @@ module Program =
                     match backend with
                     | Some value when not (String.IsNullOrWhiteSpace value) -> Path.Combine(sessionDir sessionId, value)
                     | _ -> sessionDir sessionId
+                let path = Path.Combine(dir, fileName)
+                if File.Exists path then
+                    let contentType =
+                        if fileName.EndsWith(".json", StringComparison.OrdinalIgnoreCase) then
+                            "application/json; charset=utf-8"
+                        else
+                            "audio/wav"
+                    Some { Path = path; ContentType = contentType }
+                else
+                    None
+
+            member _.TryGetTurnArtifact(sessionId: string, turnIndex: int, backend: string option, fileName: string) =
+                let dir =
+                    match backend with
+                    | Some value when not (String.IsNullOrWhiteSpace value) -> Path.Combine(turnDir sessionId turnIndex, value)
+                    | _ -> turnDir sessionId turnIndex
                 let path = Path.Combine(dir, fileName)
                 if File.Exists path then
                     let contentType =
@@ -376,7 +416,7 @@ module Program =
                 use! socket = wsClient.ConnectAsync(Uri($"ws://localhost{websocketUrl}"), CancellationToken.None)
                 let seen = ResizeArray<string>()
                 let mutable binaryMessages = 0
-                let receiveTextType () =
+                let receiveTextPayload () =
                     task {
                         let! messageType, payload = receiveMessage socket
                         match messageType with
@@ -388,39 +428,60 @@ module Program =
                                 |> Option.ofObj
                                 |> Option.defaultValue ""
                             seen.Add(eventType)
-                            return eventType
+                            return eventType, Some(doc.RootElement.Clone())
                         | WebSocketMessageType.Binary ->
                             binaryMessages <- binaryMessages + 1
-                            return "binary"
-                        | _ -> return "close"
+                            return "binary", None
+                        | _ -> return "close", None
+                    }
+
+                let receiveTextType () =
+                    task {
+                        let! eventType, _ = receiveTextPayload ()
+                        return eventType
+                    }
+
+                let sendTurn samples =
+                    task {
+                        do! sendText socket """{"type":"turn.start"}"""
+                        let! accepted = receiveTextType ()
+                        assertEqual "turn accepted" "turn.accepted" accepted
+                        do! sendBinary socket (AudioChunk.float32ToLittleEndianBytes samples)
+                        let! chunkAck = receiveTextType ()
+                        assertEqual "turn chunk" "turn.chunk" chunkAck
+                        do! sendText socket """{"type":"turn.end"}"""
+
+                        let mutable donePayload: JsonElement option = None
+                        let stopwatch = Stopwatch.StartNew()
+                        while donePayload.IsNone && stopwatch.Elapsed < TimeSpan.FromSeconds(5.0) do
+                            let! eventType, payload = receiveTextPayload ()
+                            if eventType = "generation.done" then
+                                donePayload <- payload
+
+                        match donePayload with
+                        | None ->
+                            let seenEvents = String.Join(",", seen)
+                            return fail "websocket generation" $"generation.done was not observed. Events: {seenEvents}"
+                        | Some payload -> return payload.GetProperty("turnIndex").GetInt32()
                     }
 
                 let! first = receiveTextType ()
                 assertEqual "socket ready" "session.ready" first
-                do! sendText socket """{"type":"turn.start"}"""
-                let! accepted = receiveTextType ()
-                assertEqual "turn accepted" "turn.accepted" accepted
-                do! sendBinary socket (AudioChunk.float32ToLittleEndianBytes [| 0.0f; 0.2f |])
-                let! chunkAck = receiveTextType ()
-                assertEqual "turn chunk" "turn.chunk" chunkAck
-                do! sendText socket """{"type":"turn.end"}"""
-
-                let mutable doneSeen = false
-                let stopwatch = Stopwatch.StartNew()
-                while not doneSeen && stopwatch.Elapsed < TimeSpan.FromSeconds(5.0) do
-                    let! eventType = receiveTextType ()
-                    doneSeen <- eventType = "generation.done"
-
-                if not doneSeen then
-                    let seenEvents = String.Join(",", seen)
-                    fail "websocket generation" $"generation.done was not observed. Events: {seenEvents}"
-                if binaryMessages = 0 then
-                    fail "websocket generation" "expected one streamed audio binary payload"
+                let! firstTurn = sendTurn [| 0.0f; 0.2f |]
+                let! secondTurn = sendTurn [| 0.1f; 0.3f |]
+                assertEqual "first turn index" 1 firstTurn
+                assertEqual "second turn index" 2 secondTurn
+                if binaryMessages < 2 then
+                    fail "websocket generation" "expected streamed audio binary payloads for both turns"
 
                 let! detailsResponse = client.GetAsync($"/api/s2s/sessions/{sessionId}/details.json")
                 assertEqual "details artifact" HttpStatusCode.OK detailsResponse.StatusCode
                 let! audioResponse = client.GetAsync($"/api/s2s/sessions/{sessionId}/fsharp_onnx/audio.wav")
                 assertEqual "audio artifact" HttpStatusCode.OK audioResponse.StatusCode
+                let! turnDetailsResponse = client.GetAsync($"/api/s2s/sessions/{sessionId}/turns/2/fsharp_onnx/details.json")
+                assertEqual "turn details artifact" HttpStatusCode.OK turnDetailsResponse.StatusCode
+                let! turnAudioResponse = client.GetAsync($"/api/s2s/sessions/{sessionId}/turns/2/fsharp_onnx/audio.wav")
+                assertEqual "turn audio artifact" HttpStatusCode.OK turnAudioResponse.StatusCode
             })
 
     let private configDefaultsAndBinding () =
@@ -436,6 +497,9 @@ module Program =
         assertEqual "default sampling top p" 0.95 defaults.SamplingTopP
         assertEqual "default sampling top k" 50 defaults.SamplingTopK
         assertEqual "default max queue" 32 defaults.MaxQueueLength
+        assertEqual "default max history turns" 2 defaults.MaxHistoryTurns
+        assertEqual "default max history audio seconds" 180.0 defaults.MaxHistoryAudioSeconds
+        assertEqual "default include assistant history" true defaults.IncludeAssistantAudioInHistory
 
         let values = Dictionary<string, string>()
         values["ChromaOnnx:S2s:ModelDir"] <- "models/custom"
@@ -445,6 +509,9 @@ module Program =
         values["ChromaOnnx:S2s:SamplingTemperature"] <- "0.7"
         values["ChromaOnnx:S2s:SamplingTopP"] <- "0.9"
         values["ChromaOnnx:S2s:SamplingTopK"] <- "25"
+        values["ChromaOnnx:S2s:MaxHistoryTurns"] <- "3"
+        values["ChromaOnnx:S2s:MaxHistoryAudioSeconds"] <- "120"
+        values["ChromaOnnx:S2s:IncludeAssistantAudioInHistory"] <- "false"
         let configuration =
             ConfigurationBuilder()
                 .AddInMemoryCollection(values)
@@ -457,6 +524,9 @@ module Program =
         assertEqual "bound sampling temperature" 0.7 bound.SamplingTemperature
         assertEqual "bound sampling top p" 0.9 bound.SamplingTopP
         assertEqual "bound sampling top k" 25 bound.SamplingTopK
+        assertEqual "bound max history turns" 3 bound.MaxHistoryTurns
+        assertEqual "bound max history audio seconds" 120.0 bound.MaxHistoryAudioSeconds
+        assertEqual "bound include assistant history" false bound.IncludeAssistantAudioInHistory
 
     let private runtimePathResolution () =
         let normalize path = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path))

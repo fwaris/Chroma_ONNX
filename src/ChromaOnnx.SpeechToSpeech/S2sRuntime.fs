@@ -21,7 +21,26 @@ type private RuntimeSession =
       MaxNewFrames: int
       CreatedUtc: DateTimeOffset
       WorkDir: string
+      SyncRoot: obj
+      Turns: ResizeArray<RuntimeTurn>
+      mutable NextTurnIndex: int
       mutable LastDetails: JsonElement option }
+
+and private RuntimeTurn =
+    { TurnIndex: int
+      RequestId: string
+      UserAudio16k: float32 array
+      AssistantAudio24k: float32 array
+      AssistantAudio16k: float32 array
+      WorkDir: string }
+
+type private RuntimeBackendOutput =
+    { Result: S2sBackendResult
+      Audio24k: float32 array }
+
+type private RuntimeContextSelection =
+    { Context: S2sTurnContext
+      ConversationAudios: NativeS2sConversationAudio array }
 
 type private RuntimeSessionStore(workDir: string, promptSampleRate: int, runtimeMode: string) =
     let sessions = ConcurrentDictionary<string, RuntimeSession>(StringComparer.Ordinal)
@@ -58,6 +77,9 @@ type private RuntimeSessionStore(workDir: string, promptSampleRate: int, runtime
               MaxNewFrames = maxNewFrames
               CreatedUtc = DateTimeOffset.UtcNow
               WorkDir = sessionDir
+              SyncRoot = obj ()
+              Turns = ResizeArray<RuntimeTurn>()
+              NextTurnIndex = 1
               LastDetails = None }
 
         sessions[id] <- session
@@ -122,6 +144,9 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
     let maxQueueLength = max 0 options.MaxQueueLength
     let maxPromptAudioSeconds = Math.Max(0.1, options.MaxPromptAudioSeconds)
     let maxTurnAudioSeconds = Math.Max(0.1, options.MaxTurnAudioSeconds)
+    let maxHistoryTurns = max 0 options.MaxHistoryTurns
+    let maxHistoryAudioSeconds = Math.Max(0.0, options.MaxHistoryAudioSeconds)
+    let includeAssistantAudioInHistory = options.IncludeAssistantAudioInHistory
     let optimizedModelCacheDir =
         if String.IsNullOrWhiteSpace options.OptimizedModelCacheDir then
             None
@@ -179,8 +204,92 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
         File.WriteAllText(path, json)
         jsonElement payload
 
+    let turnDirectory (session: RuntimeSession) (turnIndex: int) =
+        Path.Combine(session.WorkDir, "turns", turnIndex.ToString("0000", CultureInfo.InvariantCulture))
+
+    let backendDirectory (session: RuntimeSession) turnIndex backend =
+        Path.Combine(turnDirectory session turnIndex, backend)
+
+    let tensorToArray (tensor: DenseTensor<float32>) =
+        let count = tensor.Dimensions.ToArray() |> Array.fold (fun total dim -> total * dim) 1
+        let values = Array.zeroCreate<float32> count
+        if count > 0 then
+            tensor.Buffer.Span.Slice(0, count).CopyTo(values.AsSpan())
+        values
+
+    let resampleLinear (sourceRate: int) (targetRate: int) (samples: float32 array) =
+        if samples.Length = 0 || sourceRate = targetRate then
+            samples
+        else
+            let length = max 1 (int (Math.Round(float samples.Length * float targetRate / float sourceRate)))
+            let output = Array.zeroCreate<float32> length
+            let scale = float sourceRate / float targetRate
+            for index in 0 .. length - 1 do
+                let source = float index * scale
+                let left = int (Math.Floor source)
+                let right = min (left + 1) (samples.Length - 1)
+                let mix = source - float left
+                let a = float samples[min left (samples.Length - 1)]
+                let b = float samples[right]
+                output[index] <- float32 (a * (1.0 - mix) + b * mix)
+            output
+
+    let reserveTurnIndex (session: RuntimeSession) =
+        lock session.SyncRoot (fun () ->
+            let turnIndex = session.NextTurnIndex
+            session.NextTurnIndex <- turnIndex + 1
+            turnIndex)
+
+    let completedTurns (session: RuntimeSession) =
+        lock session.SyncRoot (fun () -> session.Turns.ToArray())
+
+    let selectContext (session: RuntimeSession) turnIndex (currentUserAudio16k: float32 array) =
+        let completed = completedTurns session |> Array.sortBy _.TurnIndex
+        let mutable totalSamples = currentUserAudio16k.Length
+        let maxHistoryAudioSamples =
+            if maxHistoryAudioSeconds <= 0.0 then
+                0
+            else
+                int (Math.Ceiling(maxHistoryAudioSeconds * float processor.ThinkerSampleRate))
+        let selectedNewestFirst = ResizeArray<RuntimeTurn>()
+
+        for turn in completed |> Array.rev do
+            if selectedNewestFirst.Count < maxHistoryTurns then
+                let assistantSamples =
+                    if includeAssistantAudioInHistory then turn.AssistantAudio16k.Length else 0
+                let turnSamples = turn.UserAudio16k.Length + assistantSamples
+                let withinAudioBudget =
+                    maxHistoryAudioSamples > 0
+                    && totalSamples + turnSamples <= maxHistoryAudioSamples
+                if withinAudioBudget then
+                    selectedNewestFirst.Add(turn)
+                    totalSamples <- totalSamples + turnSamples
+
+        let selected =
+            selectedNewestFirst.ToArray()
+            |> Array.rev
+
+        let conversationAudios = ResizeArray<NativeS2sConversationAudio>()
+        for turn in selected do
+            conversationAudios.Add({ Role = "user"; Audio16k = turn.UserAudio16k })
+            if includeAssistantAudioInHistory && turn.AssistantAudio16k.Length > 0 then
+                conversationAudios.Add({ Role = "assistant"; Audio16k = turn.AssistantAudio16k })
+        conversationAudios.Add({ Role = "user"; Audio16k = currentUserAudio16k })
+
+        { Context =
+            { TurnIndex = turnIndex
+              HistoryTurnsUsed = selected.Length
+              HistoryAudioSeconds = Math.Round(float totalSamples / float processor.ThinkerSampleRate, 3)
+              HistoryDropped = completed.Length - selected.Length }
+          ConversationAudios = conversationAudios.ToArray() }
+
+    let addCompletedTurn (session: RuntimeSession) (turn: RuntimeTurn) =
+        lock session.SyncRoot (fun () -> session.Turns.Add(turn))
+
     let runFsharpBackend
         (session: RuntimeSession)
+        (requestId: string)
+        (context: S2sTurnContext)
         (prepared: NativeS2sPrepared)
         (onFrame: S2sGeneratedFrame -> unit)
         (onAudioChunk: S2sAudioChunk -> unit)
@@ -188,7 +297,7 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
         (cancellationToken: CancellationToken)
         =
         let backend = "fsharp_onnx"
-        let backendDir = Path.Combine(session.WorkDir, backend)
+        let backendDir = backendDirectory session context.TurnIndex backend
         Directory.CreateDirectory(backendDir) |> ignore
         let memoryBefore = RuntimeMemory.current()
         use result =
@@ -209,16 +318,22 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
         let wavPath = Path.Combine(backendDir, "audio.wav")
         TensorIO.writeInt64s codesPath result.AudioCodes
         TensorIO.writeSingles rawAudioPath result.AudioValues
+        let assistantAudio24k = tensorToArray result.AudioValues
         let wavStats = Wave.writeMono16 wavPath 24000 result.AudioValues
         let generationFrameRateFps =
             match result.Timings.TryGetValue "generateMs" with
             | true, generateMs when generateMs > 0.0 -> Nullable(Math.Round(float result.FrameCount / (generateMs / 1000.0), 3))
             | _ -> Nullable<float>()
         let truncatedByMaxFrames = result.StopReason = "max_frames"
-        let detailsUrl = $"/api/s2s/sessions/{session.Id}/{backend}/details.json"
-        let audioUrl = $"/api/s2s/sessions/{session.Id}/{backend}/audio.wav"
+        let detailsUrl = $"/api/s2s/sessions/{session.Id}/turns/{context.TurnIndex}/{backend}/details.json"
+        let audioUrl = $"/api/s2s/sessions/{session.Id}/turns/{context.TurnIndex}/{backend}/audio.wav"
         let details =
             {| id = session.Id
+               requestId = requestId
+               turnIndex = context.TurnIndex
+               historyTurnsUsed = context.HistoryTurnsUsed
+               historyAudioSeconds = context.HistoryAudioSeconds
+               historyDropped = context.HistoryDropped
                backend = backend
                label = backendLabel backend
                mode = backendMode
@@ -268,10 +383,12 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
                wav = wavStats
                pythonInRequestPath = false |}
         let detailsElement = writeDetails (Path.Combine(backendDir, "details.json")) details
-        { Backend = backend
-          AudioUrl = audioUrl
-          DetailsUrl = detailsUrl
-          Details = detailsElement }
+        { Result =
+            { Backend = backend
+              AudioUrl = audioUrl
+              DetailsUrl = detailsUrl
+              Details = detailsElement }
+          Audio24k = assistantAudio24k }
 
     let tryArtifactPath (session: RuntimeSession) (backend: string option) fileName =
         if not (safeId session.Id) then
@@ -283,6 +400,19 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
                     let normalized = normalizeBackend value
                     Path.Combine(session.WorkDir, normalized, fileName)
                 | _ -> Path.Combine(session.WorkDir, fileName)
+            if File.Exists path then Some path else None
+
+    let tryTurnArtifactPath (session: RuntimeSession) turnIndex (backend: string option) fileName =
+        if not (safeId session.Id) || turnIndex < 1 then
+            None
+        else
+            let turnDir = turnDirectory session turnIndex
+            let path =
+                match backend with
+                | Some value when value <> "" ->
+                    let normalized = normalizeBackend value
+                    Path.Combine(turnDir, normalized, fileName)
+                | _ -> Path.Combine(turnDir, fileName)
             if File.Exists path then Some path else None
 
     interface IS2sRuntime with
@@ -321,6 +451,9 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
               SamplingTopK = samplingOptions.TopK
               MaxPromptAudioSeconds = maxPromptAudioSeconds
               MaxTurnAudioSeconds = maxTurnAudioSeconds
+              MaxHistoryTurns = maxHistoryTurns
+              MaxHistoryAudioSeconds = maxHistoryAudioSeconds
+              IncludeAssistantAudioInHistory = includeAssistantAudioInHistory
               GlobalGpuMemory = RuntimeMemory.tryGlobalGpuMemory()
               PeakPrivateGb = runner.PeakPrivateGb
               PeakWorkingSetGb = runner.PeakWorkingSetGb
@@ -374,6 +507,7 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
                         request.RequestId
                         |> Option.filter (String.IsNullOrWhiteSpace >> not)
                         |> Option.defaultWith (fun () -> $"{session.Id}_{Guid.NewGuid():N}")
+                    let turnIndex = reserveTurnIndex session
                     let resultSource = TaskCompletionSource<S2sTurnResult>(TaskCreationOptions.RunContinuationsAsynchronously)
                     let emitBlocking event =
                         emit event |> fun work -> work.GetAwaiter().GetResult()
@@ -385,7 +519,12 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
                                 jobCancellationToken.ThrowIfCancellationRequested()
                                 do! emit (QueueStarted(requestId, workQueue.QueueLength))
                                 let turnAudioBytes = ChromaOnnx.AudioChunk.float32ToLittleEndianBytes request.UserAudio16k
+                                let turnDir = turnDirectory session turnIndex
+                                Directory.CreateDirectory(turnDir) |> ignore
+                                File.WriteAllBytes(Path.Combine(turnDir, "user_audio_16k.f32"), turnAudioBytes)
                                 File.WriteAllBytes(Path.Combine(session.WorkDir, "user_audio_16k.f32"), turnAudioBytes)
+                                let contextSelection = selectContext session turnIndex request.UserAudio16k
+                                let context = contextSelection.Context
                                 do!
                                     emit (
                                         GenerationStarted(
@@ -393,11 +532,20 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
                                             session.MaxNewFrames,
                                             streamDecodeFrames,
                                             streamMinFreeVramMb,
-                                            codecStallGuardFrames
+                                            codecStallGuardFrames,
+                                            context
                                         )
                                     )
 
-                                use prepared = processor.Prepare(session.PromptText, session.SystemPrompt, session.PromptAudio24k, request.UserAudio16k)
+                                use prepared =
+                                    processor.PrepareConversation(
+                                        session.PromptText,
+                                        session.SystemPrompt,
+                                        session.PromptAudio24k,
+                                        contextSelection.ConversationAudios,
+                                        request.UserAudio16k.Length
+                                    )
+                                File.WriteAllText(Path.Combine(turnDir, "conversation.txt"), prepared.ConversationText)
                                 File.WriteAllText(Path.Combine(session.WorkDir, "conversation.txt"), prepared.ConversationText)
                                 let onFrame frame = emitBlocking (GenerationFrame(requestId, frame))
                                 let onAudioChunk chunk = emitBlocking (AudioChunk(requestId, chunk))
@@ -426,23 +574,39 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
                                                 )
                                             false
 
-                                let backendResult =
+                                let backendOutput =
                                     runFsharpBackend
                                         session
+                                        requestId
+                                        context
                                         prepared
                                         onFrame
                                         onAudioChunk
                                         shouldDecodeChunk
                                         jobCancellationToken
+                                let backendResult = backendOutput.Result
 
-                                let backendDir = Path.Combine(session.WorkDir, backendResult.Backend)
-                                let backendAudioPath = Path.Combine(backendDir, "audio.wav")
+                                let turnBackendDir = backendDirectory session turnIndex backendResult.Backend
+                                let legacyBackendDir = Path.Combine(session.WorkDir, backendResult.Backend)
+                                Directory.CreateDirectory(legacyBackendDir) |> ignore
+                                for fileName in [| "audio.wav"; "details.json" |] do
+                                    let sourcePath = Path.Combine(turnBackendDir, fileName)
+                                    if File.Exists sourcePath then
+                                        File.Copy(sourcePath, Path.Combine(legacyBackendDir, fileName), true)
+                                let backendAudioPath = Path.Combine(turnBackendDir, "audio.wav")
                                 if File.Exists backendAudioPath then
                                     File.Copy(backendAudioPath, Path.Combine(session.WorkDir, "audio.wav"), true)
+
+                                let assistantAudio16k =
+                                    resampleLinear 24000 processor.ThinkerSampleRate backendOutput.Audio24k
 
                                 let details =
                                     {| id = session.Id
                                        requestId = requestId
+                                       turnIndex = context.TurnIndex
+                                       historyTurnsUsed = context.HistoryTurnsUsed
+                                       historyAudioSeconds = context.HistoryAudioSeconds
+                                       historyDropped = context.HistoryDropped
                                        mode = runtimeMode
                                        generationMode = generationMode
                                        samplingEnabled = samplingOptions.Enabled
@@ -457,12 +621,25 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
                                        pythonInRequestPath = false
                                        results = [| backendResult.Details |] |}
                                 let detailsJson = JsonSerializer.Serialize(details, jsonOptions)
+                                File.WriteAllText(Path.Combine(turnDir, "details.json"), detailsJson)
                                 File.WriteAllText(Path.Combine(session.WorkDir, "details.json"), detailsJson)
                                 use doc = JsonDocument.Parse(detailsJson)
                                 session.LastDetails <- Some(doc.RootElement.Clone())
+                                addCompletedTurn
+                                    session
+                                    { TurnIndex = turnIndex
+                                      RequestId = requestId
+                                      UserAudio16k = Array.copy request.UserAudio16k
+                                      AssistantAudio24k = backendOutput.Audio24k
+                                      AssistantAudio16k = assistantAudio16k
+                                      WorkDir = turnDir }
                                 let turnResult =
                                     { Id = session.Id
                                       RequestId = requestId
+                                      TurnIndex = context.TurnIndex
+                                      HistoryTurnsUsed = context.HistoryTurnsUsed
+                                      HistoryAudioSeconds = context.HistoryAudioSeconds
+                                      HistoryDropped = context.HistoryDropped
                                       Backend = session.Backend
                                       AudioUrl = backendResult.AudioUrl
                                       DetailsUrl = backendResult.DetailsUrl
@@ -511,6 +688,22 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
                         | "audio.wav" -> Some "audio/wav"
                         | _ -> None
                     match contentType, tryArtifactPath session backend fileName with
+                    | Some mediaType, Some path -> Some { Path = path; ContentType = mediaType }
+                    | _ -> None
+
+        member _.TryGetTurnArtifact(sessionId: string, turnIndex: int, backend: string option, fileName: string) =
+            if not (safeId sessionId) || turnIndex < 1 then
+                None
+            else
+                match store.TryGet sessionId with
+                | None -> None
+                | Some session ->
+                    let contentType =
+                        match fileName with
+                        | "details.json" -> Some "application/json; charset=utf-8"
+                        | "audio.wav" -> Some "audio/wav"
+                        | _ -> None
+                    match contentType, tryTurnArtifactPath session turnIndex backend fileName with
                     | Some mediaType, Some path -> Some { Path = path; ContentType = mediaType }
                     | _ -> None
 

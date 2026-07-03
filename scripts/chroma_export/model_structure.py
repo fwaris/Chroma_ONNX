@@ -35,8 +35,8 @@ def build_chroma_wrappers(torch, DynamicCache):
         tensor lengths to Python lists, then splits into tower windows. Legacy
         torch.onnx.export bakes those list lengths into Split attributes. Chroma
         S2S V1 is batch=1, so we can preserve the same windowed audio-tower math
-        with a static max feature tensor [1, 128, 30000] and a dynamic mask that
-        selects the real active length.
+        with static max feature tensors [audio_items, 128, 30000] and dynamic
+        masks that select each real active length.
         """
 
         thinker = chroma.thinker
@@ -46,12 +46,10 @@ def build_chroma_wrappers(torch, DynamicCache):
         audio_tower.config._attn_implementation = "eager"
 
         def dynamic_audio_tower_forward(input_features, feature_lens=None, aftercnn_lens=None, **kwargs):
-            if input_features.dim() == 3:
-                features = input_features[0]
-            else:
-                features = input_features
+            if input_features.dim() == 2:
+                input_features = input_features.unsqueeze(0)
 
-            total_frames = features.shape[-1]
+            total_frames = input_features.shape[-1]
             window = audio_tower.n_window * 2
             if total_frames % window != 0:
                 raise RuntimeError(
@@ -59,17 +57,24 @@ def build_chroma_wrappers(torch, DynamicCache):
                 )
 
             max_chunks = total_frames // window
-            feature_len = feature_lens[0].to(torch.long)
-            frame_positions = torch.arange(total_frames, device=features.device, dtype=torch.long)
-            valid_frames = frame_positions < feature_len
-            valid_chunks = valid_frames.reshape(max_chunks, window)
+            audio_count = input_features.shape[0]
+            feature_lens = feature_lens.to(torch.long)
+            frame_positions = torch.arange(total_frames, device=input_features.device, dtype=torch.long)
+            valid_frames = frame_positions.unsqueeze(0) < feature_lens.unsqueeze(1)
+            valid_chunks = valid_frames.reshape(audio_count, max_chunks, window)
 
-            padded_feature = features.reshape(audio_tower.num_mel_bins, max_chunks, window).permute(1, 0, 2)
-            active_chunk_count = torch.clamp((feature_len + window - 1) // window, min=1, max=max_chunks)
-            chunk_positions = torch.arange(max_chunks, device=features.device, dtype=torch.long)
-            active_chunk_indices = torch.nonzero(chunk_positions < active_chunk_count, as_tuple=False).squeeze(1)
+            padded_feature = (
+                input_features
+                .reshape(audio_count, audio_tower.num_mel_bins, max_chunks, window)
+                .permute(0, 2, 1, 3)
+                .reshape(audio_count * max_chunks, audio_tower.num_mel_bins, window)
+            )
+            active_chunk_count = torch.clamp((feature_lens + window - 1) // window, min=1, max=max_chunks)
+            chunk_positions = torch.arange(max_chunks, device=input_features.device, dtype=torch.long)
+            active_chunk_mask = chunk_positions.unsqueeze(0) < active_chunk_count.unsqueeze(1)
+            active_chunk_indices = torch.nonzero(active_chunk_mask.reshape(-1), as_tuple=False).squeeze(1)
             padded_feature = torch.index_select(padded_feature, 0, active_chunk_indices)
-            valid_chunks = torch.index_select(valid_chunks, 0, active_chunk_indices)
+            valid_chunks = torch.index_select(valid_chunks.reshape(audio_count * max_chunks, window), 0, active_chunk_indices)
             padded_feature = padded_feature * valid_chunks.unsqueeze(1).to(padded_feature.dtype)
             padded_mask = valid_chunks.unsqueeze(1).to(padded_feature.dtype)
 
@@ -82,7 +87,7 @@ def build_chroma_wrappers(torch, DynamicCache):
             chunk_lengths = valid_chunks.long().sum(dim=1)
             zero_lengths = torch.zeros_like(chunk_lengths)
             feature_lens_after_cnn = torch.where(chunk_lengths > 0, (chunk_lengths - 1) // 2 + 1, zero_lengths)
-            cnn_positions = torch.arange(padded_embed.shape[1], device=features.device, dtype=torch.long)
+            cnn_positions = torch.arange(padded_embed.shape[1], device=input_features.device, dtype=torch.long)
             padded_mask_after_cnn = cnn_positions.unsqueeze(0) < feature_lens_after_cnn.unsqueeze(1)
 
             hidden_states = padded_embed
@@ -127,16 +132,27 @@ def build_chroma_wrappers(torch, DynamicCache):
                 hidden_states = residual + hidden_states
                 hidden_states = hidden_states * padded_mask_after_cnn.unsqueeze(-1).to(hidden_states.dtype)
 
-            audio_state_len = aftercnn_lens[0].to(torch.long)
             flat_hidden_states = hidden_states.reshape(hidden_states.shape[0] * hidden_states.shape[1], hidden_states.shape[2])
             flat_valid = padded_mask_after_cnn.reshape(hidden_states.shape[0] * hidden_states.shape[1])
             valid_indices = torch.nonzero(flat_valid, as_tuple=False).squeeze(1)
             hidden_states = torch.index_select(flat_hidden_states, 0, valid_indices)
-            audio_positions = torch.arange(hidden_states.shape[0], device=hidden_states.device, dtype=torch.long)
-            hidden_states = hidden_states[audio_positions < audio_state_len]
-            token_audio = audio_tower.avg_pooler(hidden_states.transpose(0, 1)).transpose(0, 1)
-            token_audio = audio_tower.ln_post(token_audio)
-            token_audio = audio_tower.proj(token_audio)
+
+            # The upstream eager implementation pools each audio item independently, then concatenates
+            # the token-audio rows. ONNX export traces this loop with the dummy audio count used by the
+            # exporter; the runtime should use a bundle regenerated with a count that covers the desired
+            # history window.
+            token_audio_parts = []
+            start = 0
+            for audio_index in range(input_features.shape[0]):
+                audio_state_len = aftercnn_lens[audio_index].to(torch.long)
+                stop = start + audio_state_len
+                each_audio_states = hidden_states[start:stop]
+                start = stop
+                each_token_audio = audio_tower.avg_pooler(each_audio_states.transpose(0, 1)).transpose(0, 1)
+                each_token_audio = audio_tower.ln_post(each_token_audio)
+                each_token_audio = audio_tower.proj(each_token_audio)
+                token_audio_parts.append(each_token_audio)
+            token_audio = torch.cat(token_audio_parts, dim=0)
             return SimpleNamespace(last_hidden_state=token_audio)
 
         def dynamic_get_audio_features(input_features, feature_attention_mask=None, audio_feature_lengths=None):

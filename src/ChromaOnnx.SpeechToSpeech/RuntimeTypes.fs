@@ -29,6 +29,9 @@ type S2sRuntimeOptions() =
     member val MaxQueueLength = 32 with get, set
     member val MaxPromptAudioSeconds = 60.0 with get, set
     member val MaxTurnAudioSeconds = 60.0 with get, set
+    member val MaxHistoryTurns = 2 with get, set
+    member val MaxHistoryAudioSeconds = 180.0 with get, set
+    member val IncludeAssistantAudioInHistory = true with get, set
 
 module S2sRuntimePaths =
     let private notBlank (value: string | null) =
@@ -143,9 +146,19 @@ type S2sBackendResult =
       DetailsUrl: string
       Details: JsonElement }
 
+type S2sTurnContext =
+    { TurnIndex: int
+      HistoryTurnsUsed: int
+      HistoryAudioSeconds: float
+      HistoryDropped: int }
+
 type S2sTurnResult =
     { Id: string
       RequestId: string
+      TurnIndex: int
+      HistoryTurnsUsed: int
+      HistoryAudioSeconds: float
+      HistoryDropped: int
       Backend: string
       AudioUrl: string
       DetailsUrl: string
@@ -163,7 +176,7 @@ type S2sStreamingEvent =
     | QueueEnqueued of requestId: string * snapshot: WorkQueuePosition
     | QueueUpdated of snapshot: WorkQueuePosition
     | QueueStarted of requestId: string * queueLength: int
-    | GenerationStarted of requestId: string * maxNewFrames: int * streamDecodeFrames: int * streamMinFreeVramMb: int * codecStallGuardFrames: int
+    | GenerationStarted of requestId: string * maxNewFrames: int * streamDecodeFrames: int * streamMinFreeVramMb: int * codecStallGuardFrames: int * context: S2sTurnContext
     | GenerationFrame of requestId: string * frame: S2sGeneratedFrame
     | AudioChunk of requestId: string * chunk: S2sAudioChunk
     | AudioDeferred of requestId: string * deferred: S2sAudioDeferredEvent
@@ -200,6 +213,9 @@ type S2sRuntimeStatus =
       SamplingTopK: int
       MaxPromptAudioSeconds: float
       MaxTurnAudioSeconds: float
+      MaxHistoryTurns: int
+      MaxHistoryAudioSeconds: float
+      IncludeAssistantAudioInHistory: bool
       GlobalGpuMemory: RuntimeMemory.GpuGlobalSnapshot option
       PeakPrivateGb: float
       PeakWorkingSetGb: float
@@ -234,3 +250,4 @@ type IS2sRuntime =
         emit: (S2sStreamingEvent -> Task) *
         cancellationToken: CancellationToken -> Task<S2sTurnResult>
     abstract TryGetArtifact: sessionId: string * backend: string option * fileName: string -> S2sArtifact option
+    abstract TryGetTurnArtifact: sessionId: string * turnIndex: int * backend: string option * fileName: string -> S2sArtifact option

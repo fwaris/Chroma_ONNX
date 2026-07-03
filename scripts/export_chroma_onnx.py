@@ -236,18 +236,21 @@ def main() -> int:
 
     if s2s_shared_bundle:
         audio_placeholder_count = 25
-        dummy_thinker_sequence = max(args.sequence_length, audio_placeholder_count + 4)
+        dummy_thinker_audio_count = 5
+        dummy_thinker_sequence = max(args.sequence_length, dummy_thinker_audio_count * audio_placeholder_count + 4)
         dummy_thinker_ids = torch.zeros(args.batch, dummy_thinker_sequence, dtype=torch.long, device=args.device)
-        dummy_thinker_ids[:, 1 : 1 + audio_placeholder_count] = int(config.thinker_config.audio_token_index)
+        for audio_index in range(dummy_thinker_audio_count):
+            start = 1 + audio_index * audio_placeholder_count
+            dummy_thinker_ids[:, start : start + audio_placeholder_count] = int(config.thinker_config.audio_token_index)
         dummy_thinker_attention = torch.ones(args.batch, dummy_thinker_sequence, dtype=torch.long, device=args.device)
         dummy_thinker_features = torch.zeros(
-            args.batch,
+            dummy_thinker_audio_count,
             thinker_feature_size,
             thinker_max_frames,
             dtype=module_dtype(model.thinker, torch.float32),
             device=args.device,
         )
-        dummy_thinker_feature_mask = torch.zeros(args.batch, thinker_max_frames, dtype=torch.long, device=args.device)
+        dummy_thinker_feature_mask = torch.zeros(dummy_thinker_audio_count, thinker_max_frames, dtype=torch.long, device=args.device)
         dummy_thinker_feature_mask[:, : args.thinker_active_frames] = 1
 
         prefill_backbone_outputs = cache_io_names(BACKBONE_CACHE_PREFIX, backbone_layer_count, "present")
@@ -271,8 +274,8 @@ def main() -> int:
             "input_values_cutoffs": {0: "batch"},
             "thinker_input_ids": {0: "batch", 1: "thinker_prompt_sequence"},
             "thinker_attention_mask": {0: "batch", 1: "thinker_prompt_sequence"},
-            "thinker_input_features": {0: "batch", 2: "thinker_feature_frames"},
-            "thinker_feature_attention_mask": {0: "batch", 1: "thinker_feature_frames"},
+            "thinker_input_features": {0: "thinker_audio_items", 2: "thinker_feature_frames"},
+            "thinker_feature_attention_mask": {0: "thinker_audio_items", 1: "thinker_feature_frames"},
             "logits": {0: "batch", 1: "backbone_sequence"},
             "hidden_states": {0: "batch", 1: "backbone_sequence"},
             "next_attention_mask": {0: "batch", 1: "next_backbone_sequence"},
@@ -761,7 +764,8 @@ def main() -> int:
                 "required_graphs": sorted(S2S_REQUIRED_GRAPH_FILES),
                 "implemented_graphs": sorted(S2S_REQUIRED_GRAPH_FILES),
                 "single_onnx_model": bool(args.single_onnx_s2s),
-                "thinker_feature_mode": "dynamic_batch1_full_length",
+                "thinker_feature_mode": "dynamic_batch1_multi_audio_full_length",
+                "thinker_max_audio_items": int(dummy_thinker_audio_count),
                 "thinker_trace_active_frames": int(args.thinker_active_frames),
                 "thinker_max_frames": int(thinker_max_frames),
                 "note": (

@@ -2,10 +2,15 @@ namespace ChromaOnnx
 
 open System
 open System.IO
+open System.Text
 open System.Text.Json
 open Microsoft.ML.OnnxRuntime.Tensors
 open Tokenizers.HuggingFace.Tokenizer
 open TorchSharp
+
+type NativeS2sConversationAudio =
+    { Role: string
+      Audio16k: float32 array }
 
 type ChromaNativeProcessor(modelDir: string, ?thinkerActiveFrames: int) =
     let tokenizerPath = Path.Combine(modelDir, "tokenizer.json")
@@ -178,27 +183,48 @@ type ChromaNativeProcessor(modelDir: string, ?thinkerActiveFrames: int) =
             let afterFirstConv = ((activeFrames - 1) / 2) + 1
             max 0 (((afterFirstConv - 2) / 2) + 1)
 
-    let renderConversation (systemPrompt: string) audioTokenCount =
+    let normalizedRole role =
+        match (if String.IsNullOrWhiteSpace role then "" else role.Trim().ToLowerInvariant()) with
+        | "assistant" -> "assistant"
+        | "user" | "" -> "user"
+        | value -> invalidArg (nameof role) $"Unsupported S2S conversation role '{value}'. Use user or assistant."
+
+    let renderAudioContent audioTokenCount =
+        String.concat
+            ""
+            [ "<|audio_bos|>"
+              String.replicate (max 1 audioTokenCount) "<|AUDIO|>"
+              "<|audio_eos|>" ]
+
+    let renderConversation (systemPrompt: string) (items: (string * int) array) =
         let normalizedSystemPrompt =
             if String.IsNullOrWhiteSpace(systemPrompt) then
                 "You are a helpful assistant."
             else
                 systemPrompt.Trim()
 
-        let audioPlaceholders = String.replicate (max 1 audioTokenCount) "<|AUDIO|>"
+        let builder = StringBuilder()
+        builder.Append("<|im_start|>system\n").Append(normalizedSystemPrompt).Append("<|im_end|>\n") |> ignore
+        for role, audioTokenCount in items do
+            builder
+                .Append("<|im_start|>")
+                .Append(normalizedRole role)
+                .Append("\n")
+                .Append(renderAudioContent audioTokenCount)
+                .Append("<|im_end|>\n")
+            |> ignore
+        builder.Append("<|im_start|>assistant\n") |> ignore
+        builder.ToString()
 
-        String.concat
-            ""
-            [ "<|im_start|>system\n"
-              normalizedSystemPrompt
-              "<|im_end|>\n"
-              "<|im_start|>user\n"
-              "<|audio_bos|>"
-              audioPlaceholders
-              "<|audio_eos|><|im_end|>\n"
-              "<|im_start|>assistant\n" ]
+    let fillThinkerFeatures
+        audioIndex
+        (pcm16k: float32 array)
+        (featureBuffer: RentedTensorBuffer<float32>)
+        (maskBuffer: RentedTensorBuffer<int64>)
+        =
+        if pcm16k.Length = 0 then
+            invalidArg (nameof pcm16k) "Conversation audio PCM must contain at least one sample."
 
-    let extractThinkerFeatures (pcm16k: float32 array) =
         let sampleCount = min pcm16k.Length thinkerMaxSamples
         let activeFrames =
             if sampleCount <= 0 then
@@ -207,72 +233,88 @@ type ChromaNativeProcessor(modelDir: string, ?thinkerActiveFrames: int) =
                 min thinkerMaxFrames (((sampleCount - 1) / thinkerHopLength) + 1)
 
         let activeFramesForExport = min activeFrames thinkerActiveFrameLimit
-        let featureBuffer = RentedTensorBuffer.rent<float32> (audioFeatureSize * thinkerMaxFrames) true
-        let maskBuffer = RentedTensorBuffer.rent<int64> thinkerMaxFrames true
+        let maskOffset = audioIndex * thinkerMaxFrames
+        let mask = maskBuffer.Memory.Span.Slice(maskOffset, thinkerMaxFrames)
+        mask.Clear()
+        for frameIndex in 0 .. activeFramesForExport - 1 do
+            mask[frameIndex] <- 1L
+
+        if activeFramesForExport > 0 then
+            let framesToCompute = activeFrames
+            let samplesNeededForComputedFrames = min sampleCount (framesToCompute * thinkerHopLength)
+            let workingSampleCount = max 1 (min thinkerMaxSamples (samplesNeededForComputedFrames + thinkerNfft))
+            use workingBuffer = RentedTensorBuffer.rent<float32> workingSampleCount true
+            let workingPcm = workingBuffer.Memory.Span
+            workingPcm.Clear()
+            pcm16k
+                .AsSpan(0, min sampleCount workingSampleCount)
+                .CopyTo(workingPcm)
+
+            use waveform =
+                torch.tensor(
+                    workingBuffer.Memory,
+                    ReadOnlySpan<int64>([| int64 workingSampleCount |]),
+                    dtype = Nullable(torch.float32)
+                )
+            use window = torch.hann_window(int64 thinkerNfft, dtype = Nullable(torch.float32))
+            use stft =
+                torch.stft(
+                    waveform,
+                    int64 thinkerNfft,
+                    hop_length = int64 thinkerHopLength,
+                    win_length = int64 thinkerNfft,
+                    window = window,
+                    center = true,
+                    normalized = false,
+                    onesided = true,
+                    return_complex = true
+                )
+            use magnitude = stft.abs()
+            use powerSpectrum = magnitude * magnitude
+            use melFilters =
+                torch
+                    .tensor(melFilterBank.Value, dtype = Nullable(torch.float32))
+                    .reshape([| int64 audioFeatureSize; int64 melFrequencyBins |])
+            use melSpectrum = torch.matmul(melFilters, powerSpectrum).clamp_min(1e-10).log10()
+            use trimmed = melSpectrum.narrow(1L, 0L, int64 framesToCompute)
+            use floor = torch.maximum(trimmed, trimmed.max() - 8.0)
+            use normalized = (floor + 4.0) / 4.0
+            use contiguous = normalized.contiguous()
+            let activeFeatureValues = contiguous.data<float32>()
+            let featureValues = featureBuffer.Memory.Span
+            let audioOffset = audioIndex * audioFeatureSize * thinkerMaxFrames
+
+            for featureIndex in 0 .. audioFeatureSize - 1 do
+                activeFeatureValues.CopyTo(
+                    featureValues.Slice(audioOffset + featureIndex * thinkerMaxFrames, activeFramesForExport),
+                    0,
+                    int64 (featureIndex * framesToCompute)
+                )
+
+        audioTokenOutputLength activeFramesForExport, sampleCount
+
+    let extractThinkerFeatures (audios16k: float32 array array) =
+        if audios16k.Length = 0 then
+            invalidArg (nameof audios16k) "At least one conversation audio segment is required."
+
+        let featureBuffer = RentedTensorBuffer.rent<float32> (audios16k.Length * audioFeatureSize * thinkerMaxFrames) true
+        let maskBuffer = RentedTensorBuffer.rent<int64> (audios16k.Length * thinkerMaxFrames) true
 
         try
             featureBuffer.Memory.Span.Clear()
+            maskBuffer.Memory.Span.Clear()
+            let tokenCounts = Array.zeroCreate<int> audios16k.Length
+            let sampleCounts = Array.zeroCreate<int> audios16k.Length
+            for audioIndex in 0 .. audios16k.Length - 1 do
+                let tokenCount, sampleCount =
+                    fillThinkerFeatures audioIndex audios16k[audioIndex] featureBuffer maskBuffer
+                tokenCounts[audioIndex] <- tokenCount
+                sampleCounts[audioIndex] <- sampleCount
 
-            let mask = maskBuffer.Memory.Span
-            mask.Clear()
-            for frameIndex in 0 .. activeFramesForExport - 1 do
-                mask[frameIndex] <- 1L
-
-            if activeFramesForExport > 0 then
-                let framesToCompute = activeFrames
-                let samplesNeededForComputedFrames = min sampleCount (framesToCompute * thinkerHopLength)
-                let workingSampleCount = max 1 (min thinkerMaxSamples (samplesNeededForComputedFrames + thinkerNfft))
-                use workingBuffer = RentedTensorBuffer.rent<float32> workingSampleCount true
-                let workingPcm = workingBuffer.Memory.Span
-                workingPcm.Clear()
-                if sampleCount > 0 then
-                    pcm16k
-                        .AsSpan(0, min sampleCount workingSampleCount)
-                        .CopyTo(workingPcm)
-
-                use waveform =
-                    torch.tensor(
-                        workingBuffer.Memory,
-                        ReadOnlySpan<int64>([| int64 workingSampleCount |]),
-                        dtype = Nullable(torch.float32)
-                    )
-                use window = torch.hann_window(int64 thinkerNfft, dtype = Nullable(torch.float32))
-                use stft =
-                    torch.stft(
-                        waveform,
-                        int64 thinkerNfft,
-                        hop_length = int64 thinkerHopLength,
-                        win_length = int64 thinkerNfft,
-                        window = window,
-                        center = true,
-                        normalized = false,
-                        onesided = true,
-                        return_complex = true
-                    )
-                use magnitude = stft.abs()
-                use powerSpectrum = magnitude * magnitude
-                use melFilters =
-                    torch
-                        .tensor(melFilterBank.Value, dtype = Nullable(torch.float32))
-                        .reshape([| int64 audioFeatureSize; int64 melFrequencyBins |])
-                use melSpectrum = torch.matmul(melFilters, powerSpectrum).clamp_min(1e-10).log10()
-                use trimmed = melSpectrum.narrow(1L, 0L, int64 framesToCompute)
-                use floor = torch.maximum(trimmed, trimmed.max() - 8.0)
-                use normalized = (floor + 4.0) / 4.0
-                use contiguous = normalized.contiguous()
-                let activeFeatureValues = contiguous.data<float32>()
-                let featureValues = featureBuffer.Memory.Span
-
-                for featureIndex in 0 .. audioFeatureSize - 1 do
-                    activeFeatureValues.CopyTo(
-                        featureValues.Slice(featureIndex * thinkerMaxFrames, activeFramesForExport),
-                        0,
-                        int64 (featureIndex * framesToCompute)
-                    )
-
-            DenseTensor<float32>(featureBuffer.Memory, ReadOnlySpan<int>([| 1; audioFeatureSize; thinkerMaxFrames |]), false),
-            DenseTensor<int64>(maskBuffer.Memory, ReadOnlySpan<int>([| 1; thinkerMaxFrames |]), false),
-            audioTokenOutputLength activeFramesForExport,
+            DenseTensor<float32>(featureBuffer.Memory, ReadOnlySpan<int>([| audios16k.Length; audioFeatureSize; thinkerMaxFrames |]), false),
+            DenseTensor<int64>(maskBuffer.Memory, ReadOnlySpan<int>([| audios16k.Length; thinkerMaxFrames |]), false),
+            tokenCounts,
+            sampleCounts,
             [| featureBuffer :> IDisposable; maskBuffer :> IDisposable |]
         with
         | _ ->
@@ -298,18 +340,33 @@ type ChromaNativeProcessor(modelDir: string, ?thinkerActiveFrames: int) =
     member _.ReadFloat32PcmFromBytes(bytes: byte array) =
         monoFloat32FromLittleEndian bytes
 
-    member _.Prepare(promptText: string, systemPrompt: string, promptAudio24k: float32 array, userAudio16k: float32 array) =
+    member _.PrepareConversation
+        (
+            promptText: string,
+            systemPrompt: string,
+            promptAudio24k: float32 array,
+            conversationAudios: NativeS2sConversationAudio array,
+            currentUserAudioSamples: int
+        ) =
         if promptAudio24k.Length = 0 then
             invalidArg (nameof promptAudio24k) "Voice prompt PCM must contain at least one sample."
-        if userAudio16k.Length = 0 then
-            invalidArg (nameof userAudio16k) "User turn PCM must contain at least one sample."
+        if conversationAudios.Length = 0 then
+            invalidArg (nameof conversationAudios) "At least one conversation audio segment is required."
+        if currentUserAudioSamples <= 0 then
+            invalidArg (nameof currentUserAudioSamples) "Current user turn PCM must contain at least one sample."
 
         let promptIds = encode promptText
-        let thinkerFeatures, thinkerFeatureMask, audioTokenCount, ownedBuffers = extractThinkerFeatures userAudio16k
+        let thinkerFeatures, thinkerFeatureMask, audioTokenCounts, _, ownedBuffers =
+            conversationAudios
+            |> Array.map _.Audio16k
+            |> extractThinkerFeatures
         let owned = ResizeArray<IDisposable>(ownedBuffers)
 
         try
-            let conversationText = renderConversation systemPrompt audioTokenCount
+            let conversationText =
+                conversationAudios
+                |> Array.mapi (fun index item -> normalizedRole item.Role, audioTokenCounts[index])
+                |> renderConversation systemPrompt
             let thinkerIds = encode conversationText
 
             let inputIds, inputIdsBuffer = rentedInt64TensorFromValues promptIds [| 1; promptIds.Length |]
@@ -333,7 +390,7 @@ type ChromaNativeProcessor(modelDir: string, ?thinkerActiveFrames: int) =
                 thinkerFeatures,
                 thinkerFeatureMask,
                 promptAudio24k.Length,
-                userAudio16k.Length,
+                currentUserAudioSamples,
                 conversationText,
                 owned.ToArray()
             )
@@ -342,4 +399,16 @@ type ChromaNativeProcessor(modelDir: string, ?thinkerActiveFrames: int) =
             for buffer in owned do
                 buffer.Dispose()
             reraise()
+
+    member this.Prepare(promptText: string, systemPrompt: string, promptAudio24k: float32 array, userAudio16k: float32 array) =
+        if userAudio16k.Length = 0 then
+            invalidArg (nameof userAudio16k) "User turn PCM must contain at least one sample."
+
+        this.PrepareConversation(
+            promptText,
+            systemPrompt,
+            promptAudio24k,
+            [| { Role = "user"; Audio16k = userAudio16k } |],
+            userAudio16k.Length
+        )
 
