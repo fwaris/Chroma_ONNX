@@ -1,4 +1,5 @@
-# Python tooling for Chroma download, export, ONNX validation, and parity/debug scripts.
+# Pip-compatible fallback for Chroma download, export, ONNX validation, and parity/debug scripts.
+# For uv-managed environments, prefer `uv sync --locked` from pyproject.toml/uv.lock.
 # Use Python 3.11. Install PyTorch from the platform-specific index first if you need
 # a non-default CUDA wheel, then install this file.
 

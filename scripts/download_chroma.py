@@ -35,6 +35,8 @@ def require_huggingface_hub():
     except Exception as exc:  # pragma: no cover - only used before dependency install
         raise SystemExit(
             "Missing dependency 'huggingface_hub'. Install with:\n"
+            "  uv sync --locked\n"
+            "or:\n"
             "  pip install -r requirements.txt\n"
             f"Original import error: {exc}"
         ) from exc

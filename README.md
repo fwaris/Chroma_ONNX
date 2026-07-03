@@ -168,13 +168,12 @@ Python Chroma comparison uses PyTorch CUDA. Python `onnxruntime-gpu` is not requ
 ## Setup
 
 Use Python 3.11 for export/comparison tooling. The repo also builds the F# runner with .NET 10.
+The preferred Python environment flow is `uv sync --locked`; `requirements.txt` remains as a pip-compatible fallback.
 
 PowerShell:
 
 ```powershell
-py -3.11 -m venv .venv
-.venv\Scripts\python.exe -m pip install --upgrade pip
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+uv sync --locked
 dotnet build src\ChromaOnnx
 ```
 
@@ -204,6 +203,7 @@ The quickest working setup on a new Windows machine is:
    - cuDNN 9 for CUDA `13.3`.
    - .NET SDK `10`.
    - Python `3.11`.
+   - uv.
    - Git.
 
 2. Clone this repo:
@@ -216,9 +216,7 @@ cd Chroma_ONNX
 3. Create the Python environment and build the F# project:
 
 ```powershell
-py -3.11 -m venv .venv
-.venv\Scripts\python.exe -m pip install --upgrade pip
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+uv sync --locked
 dotnet build src\ChromaOnnx
 ```
 
