@@ -173,7 +173,8 @@ PowerShell:
 
 ```powershell
 py -3.11 -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements-convert.txt
+.venv\Scripts\python.exe -m pip install --upgrade pip
+.venv\Scripts\python.exe -m pip install -r requirements.txt
 dotnet build src\ChromaOnnx
 ```
 
@@ -217,7 +218,7 @@ cd Chroma_ONNX
 ```powershell
 py -3.11 -m venv .venv
 .venv\Scripts\python.exe -m pip install --upgrade pip
-.venv\Scripts\python.exe -m pip install -r requirements-convert.txt
+.venv\Scripts\python.exe -m pip install -r requirements.txt
 dotnet build src\ChromaOnnx
 ```
 

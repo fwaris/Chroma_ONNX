@@ -12,7 +12,7 @@ def require_python_deps():
     except Exception as exc:  # pragma: no cover - only used before dependency install
         raise SystemExit(
             "Missing conversion dependencies. Install with:\n"
-            "  pip install -r requirements-convert.txt\n"
+            "  pip install -r requirements.txt\n"
             f"Original import error: {exc}"
         ) from exc
     return torch, AutoModelForCausalLM
@@ -24,7 +24,7 @@ def require_safetensors():
     except Exception as exc:  # pragma: no cover - only used before dependency install
         raise SystemExit(
             "Missing dependency 'safetensors'. Install with:\n"
-            "  pip install -r requirements-convert.txt\n"
+            "  pip install -r requirements.txt\n"
             f"Original import error: {exc}"
         ) from exc
     return safe_open
