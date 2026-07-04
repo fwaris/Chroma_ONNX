@@ -109,7 +109,7 @@ module S2sServe =
   </header>
   <main>
     <form id="sessionForm">
-      <label>System prompt<textarea id="systemPrompt">You are a helpful assistant.</textarea></label>
+      <label>System prompt<textarea id="systemPrompt">You are Chroma, an advanced virtual human created by the FlashLabs. You possess the ability to understand auditory inputs and generate both text and speech.</textarea></label>
       <label>Reference text<textarea id="promptText" required>Why don't skeletons fight each other. They don't have the guts.</textarea></label>
       <label>Reference audio<input id="promptPcm" type="file" accept="audio/*,.f32"></label>
       <label>Turn source<select id="inputMode">
@@ -123,7 +123,7 @@ module S2sServe =
         <option value="python">Python Chroma</option>
         <option value="both">Both</option>
       </select></label>
-      <label>Max response seconds<input id="maxResponseSeconds" type="number" min="1" max="24" step="0.5" value="12"></label>
+      <label>Max response seconds<input id="maxResponseSeconds" type="number" min="1" max="72" step="0.5" value="36"></label>
       <div class="actions">
         <button id="sendButton" type="submit">Send</button>
         <button id="cancelButton" class="danger" type="button" disabled>Cancel</button>
@@ -493,7 +493,7 @@ module S2sServe =
         const promptPcm = await readReferenceAudioAsF32Bytes(24000);
         const turnPcm = mode === 'file' ? await readAudioAsF32Bytes(document.getElementById('turnPcm'), 16000) : null;
         const formData = new FormData();
-        const maxSeconds = Math.max(1, Math.min(24, Number(document.getElementById('maxResponseSeconds').value) || 12));
+        const maxSeconds = Math.max(1, Math.min(72, Number(document.getElementById('maxResponseSeconds').value) || 36));
         const maxFrames = Math.max(1, Math.round(maxSeconds * 12.5));
         formData.set('promptText', document.getElementById('promptText').value);
         formData.set('systemPrompt', document.getElementById('systemPrompt').value);
@@ -658,8 +658,8 @@ module S2sServe =
                     let backend = normalizeBackend (form["backend"].ToString())
                     let maxNewFrames =
                         match Int32.TryParse(form["maxNewFrames"].ToString()) with
-                        | true, value -> max 1 (min 300 value)
-                        | false, _ -> 150
+                        | true, value -> max 1 (min 900 value)
+                        | false, _ -> 450
 
                     if String.IsNullOrWhiteSpace(promptText) then
                         do! writeJson ctx 400 (error 400 "promptText is required.")

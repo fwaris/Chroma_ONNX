@@ -62,6 +62,7 @@ param(
     [int]$Port = 5055,
     [int]$CudaGpuMemLimitMb = 32768,
     [int]$StreamMinFreeVramMb = 4096,
+    [int]$MaxNewFrames = 900,
     [string]$CudaBin = "",
     [string]$CudnnBin = "",
     [switch]$LocalhostOnly
@@ -87,6 +88,7 @@ $env:ChromaOnnx__S2s__OptimizedModelCacheDir = Join-Path $AssetsRoot "onnx\chrom
 $env:ChromaOnnx__S2s__OptimizedModelCacheFormat = "onnx"
 $env:ChromaOnnx__S2s__CudaGpuMemLimitMb = [string]$CudaGpuMemLimitMb
 $env:ChromaOnnx__S2s__StreamMinFreeVramMb = [string]$StreamMinFreeVramMb
+$env:ChromaOnnx__S2s__MaxNewFrames = [string]$MaxNewFrames
 
 foreach ($path in @(
     (Join-Path $Root "app\service\ChromaOnnx.Service.exe"),
@@ -103,6 +105,7 @@ $hostName = if ($LocalhostOnly) { "localhost" } else { "0.0.0.0" }
 $url = "http://${hostName}:$Port"
 Write-Host "Starting ChromaS2SONNX on $url"
 Write-Host "AssetsRoot: $AssetsRoot"
+Write-Host "MaxNewFrames: $MaxNewFrames"
 & (Join-Path $Root "app\service\ChromaOnnx.Service.exe") --urls $url
 exit $LASTEXITCODE
 '@

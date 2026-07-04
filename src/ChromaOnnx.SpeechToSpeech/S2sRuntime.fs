@@ -123,8 +123,8 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
             fallback
         else
             value
-    let samplingTemperature = Math.Max(0.01, finiteOr 0.8 options.SamplingTemperature)
-    let samplingTopP = Math.Min(1.0, Math.Max(0.01, finiteOr 0.95 options.SamplingTopP))
+    let samplingTemperature = Math.Max(0.01, finiteOr 0.7 options.SamplingTemperature)
+    let samplingTopP = Math.Min(1.0, Math.Max(0.01, finiteOr 0.9 options.SamplingTopP))
     let samplingTopK = max 0 options.SamplingTopK
     let samplingOptions =
         { Enabled = generationMode = "sample"
@@ -142,6 +142,7 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
         else
             "s2s_greedy"
     let maxQueueLength = max 0 options.MaxQueueLength
+    let maxNewFrames = max 1 options.MaxNewFrames
     let maxPromptAudioSeconds = Math.Max(0.1, options.MaxPromptAudioSeconds)
     let maxTurnAudioSeconds = Math.Max(0.1, options.MaxTurnAudioSeconds)
     let maxHistoryTurns = max 0 options.MaxHistoryTurns
@@ -449,6 +450,7 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
               SamplingTemperature = samplingOptions.Temperature
               SamplingTopP = samplingOptions.TopP
               SamplingTopK = samplingOptions.TopK
+              MaxNewFrames = maxNewFrames
               MaxPromptAudioSeconds = maxPromptAudioSeconds
               MaxTurnAudioSeconds = maxTurnAudioSeconds
               MaxHistoryTurns = maxHistoryTurns
@@ -483,8 +485,8 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
                     $"promptPcm24k is too large. The configured maximum is {maxPromptAudioSamples} Float32 samples."
 
             let backend = normalizeBackend request.Backend
-            let maxNewFrames = max 1 (min 300 request.MaxNewFrames)
-            let session = store.Create(request.PromptText, request.SystemPrompt, backend, request.PromptAudio24k, maxNewFrames)
+            let requestedMaxNewFrames = max 1 (min maxNewFrames request.MaxNewFrames)
+            let session = store.Create(request.PromptText, request.SystemPrompt, backend, request.PromptAudio24k, requestedMaxNewFrames)
             File.WriteAllBytes(Path.Combine(session.WorkDir, "prompt_audio_24k.f32"), ChromaOnnx.AudioChunk.float32ToLittleEndianBytes request.PromptAudio24k)
             store.ToInfo session
 

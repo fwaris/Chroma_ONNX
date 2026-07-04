@@ -513,7 +513,7 @@ The browser lab defaults its reference text and reference audio to `assets/south
 
 On 16 GB CUDA cards, the standalone service defaults `CudaGpuMemLimitMb` to `15360` and `StreamMinFreeVramMb` to `2048` to leave VRAM headroom while still giving ORT enough arena space for large prefill allocations. Override those values with `ChromaOnnx__S2s__CudaGpuMemLimitMb` and `ChromaOnnx__S2s__StreamMinFreeVramMb` if your card has more or less VRAM.
 
-The standalone service defaults to non-deterministic sampling because it is not used for parity checks: `GenerationMode=sample`, `SamplingTemperature=0.8`, `SamplingTopP=0.95`, and `SamplingTopK=50`. Set `ChromaOnnx__S2s__GenerationMode=greedy` when you want deterministic argmax output for debugging.
+The standalone service defaults to the Chroma system prompt and non-deterministic sampling close to the official Chroma example: `GenerationMode=sample`, `SamplingTemperature=0.7`, `SamplingTopP=0.9`, and `SamplingTopK=50`. Set `ChromaOnnx__S2s__GenerationMode=greedy` when you want deterministic argmax output for debugging.
 
 API shape:
 

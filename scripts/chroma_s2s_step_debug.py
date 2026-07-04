@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Dump Chroma S2S Python intermediate tensors and compare to F#/ONNX.")
     parser.add_argument("--model-dir")
     parser.add_argument("--prompt-text")
-    parser.add_argument("--system-prompt", default="You are a helpful assistant.")
+    parser.add_argument("--system-prompt", default="You are Chroma, an advanced virtual human created by the FlashLabs. You possess the ability to understand auditory inputs and generate both text and speech.")
     parser.add_argument("--prompt-audio")
     parser.add_argument("--user-audio")
     parser.add_argument("--output-dir")

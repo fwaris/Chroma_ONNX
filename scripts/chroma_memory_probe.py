@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Persistent Python Chroma memory baseline for F#/ONNX comparison.")
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--prompt-text", required=True)
-    parser.add_argument("--system-prompt", default="You are a helpful assistant.")
+    parser.add_argument("--system-prompt", default="You are Chroma, an advanced virtual human created by the FlashLabs. You possess the ability to understand auditory inputs and generate both text and speech.")
     parser.add_argument("--prompt-audio-f32", required=True)
     parser.add_argument("--user-audio-f32", required=True)
     parser.add_argument("--output-dir", required=True)

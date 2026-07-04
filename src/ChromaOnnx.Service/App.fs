@@ -66,7 +66,7 @@ module S2sWebApp =
   </header>
   <main>
     <form id="sessionForm">
-      <label>System prompt<textarea id="systemPrompt">You are a helpful assistant.</textarea></label>
+      <label>System prompt<textarea id="systemPrompt">You are Chroma, an advanced virtual human created by the FlashLabs. You possess the ability to understand auditory inputs and generate both text and speech.</textarea></label>
       <label>Reference text<textarea id="promptText" required>Why don't skeletons fight each other. They don't have the guts.</textarea></label>
       <label>Reference audio<input id="promptPcm" type="file" accept="audio/*,.f32"></label>
       <label>Turn source<select id="inputMode">
@@ -75,7 +75,7 @@ module S2sWebApp =
       </select></label>
       <label id="turnFileLabel">Turn audio<input id="turnPcm" type="file" accept="audio/*,.f32"></label>
       <label id="micSecondsLabel" hidden>Mic seconds<input id="micSeconds" type="number" min="1" max="60" value="6"></label>
-      <label>Max response seconds<input id="maxResponseSeconds" type="number" min="1" max="24" step="0.5" value="12"></label>
+      <label>Max response seconds<input id="maxResponseSeconds" type="number" min="1" max="72" step="0.5" value="36"></label>
       <div class="actions">
         <button id="sendButton" type="submit">Send</button>
         <button id="newSessionButton" class="secondary" type="button">New</button>
@@ -399,7 +399,7 @@ module S2sWebApp =
         const turnFile = document.getElementById('turnPcm').files[0];
         if (mode === 'file' && !turnFile) throw new Error('Turn audio is required in file mode.');
         const turnBytes = mode === 'file' ? await readAudioAsF32(turnFile, 16000) : null;
-        const maxSeconds = Number(document.getElementById('maxResponseSeconds').value || 12);
+        const maxSeconds = Math.max(1, Math.min(72, Number(document.getElementById('maxResponseSeconds').value) || 36));
         const session = currentSession || await createSession(await readReferenceAudioAsF32(24000), maxSeconds);
 
         message.textContent = mode === 'mic' ? 'Opening microphone' : 'Opening WebSocket';
@@ -578,6 +578,7 @@ module S2sWebApp =
            samplingTemperature = status.SamplingTemperature
            samplingTopP = status.SamplingTopP
            samplingTopK = status.SamplingTopK
+           maxNewFrames = status.MaxNewFrames
            maxPromptAudioSeconds = status.MaxPromptAudioSeconds
            maxTurnAudioSeconds = status.MaxTurnAudioSeconds
            maxHistoryTurns = status.MaxHistoryTurns
@@ -613,8 +614,8 @@ module S2sWebApp =
                     let backend = form["backend"].ToString()
                     let maxNewFrames =
                         match Int32.TryParse(form["maxNewFrames"].ToString()) with
-                        | true, value -> max 1 (min 300 value)
-                        | false, _ -> 150
+                        | true, value -> max 1 value
+                        | false, _ -> 450
                     let promptAudioBytes = readFormFileBytes form "promptPcm24k"
                     let maxPromptBytes = runtime.MaxPromptAudioSamples * sizeof<float32>
                     if promptAudioBytes.Length > maxPromptBytes then
@@ -682,6 +683,7 @@ module S2sWebApp =
                             {| ``type`` = "session.ready"
                                id = session.Id
                                maxNewFrames = session.MaxNewFrames
+                               runtimeMaxNewFrames = runtimeStatus.MaxNewFrames
                                streamDecodeFrames = runtimeStatus.StreamDecodeFrames
                                streamMinFreeVramMb = runtimeStatus.StreamMinFreeVramMb
                                codecStallGuardFrames = runtimeStatus.CodecStallGuardFrames

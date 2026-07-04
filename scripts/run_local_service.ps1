@@ -3,6 +3,7 @@ param(
     [int]$Port = 5055,
     [int]$CudaGpuMemLimitMb = 15360,
     [int]$StreamMinFreeVramMb = 2048,
+    [int]$MaxNewFrames = 900,
     [string]$CudaBin = "",
     [string]$CudnnBin = ""
 )
@@ -31,10 +32,12 @@ $env:ChromaOnnx__S2s__OptimizedModelCacheDir = Join-Path $AssetsRoot "onnx\chrom
 $env:ChromaOnnx__S2s__OptimizedModelCacheFormat = "onnx"
 $env:ChromaOnnx__S2s__CudaGpuMemLimitMb = [string]$CudaGpuMemLimitMb
 $env:ChromaOnnx__S2s__StreamMinFreeVramMb = [string]$StreamMinFreeVramMb
+$env:ChromaOnnx__S2s__MaxNewFrames = [string]$MaxNewFrames
 
 Write-Host "Running local service from repo code."
 Write-Host "AssetsRoot: $AssetsRoot"
 Write-Host "BundleDir: $env:ChromaOnnx__S2s__BundleDir"
+Write-Host "MaxNewFrames: $MaxNewFrames"
 
 Push-Location $repoRoot
 try {

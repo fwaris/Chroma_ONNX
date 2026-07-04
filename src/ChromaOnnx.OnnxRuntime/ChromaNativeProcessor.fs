@@ -199,7 +199,7 @@ type ChromaNativeProcessor(modelDir: string, ?thinkerActiveFrames: int) =
     let renderConversation (systemPrompt: string) (items: (string * int) array) =
         let normalizedSystemPrompt =
             if String.IsNullOrWhiteSpace(systemPrompt) then
-                "You are a helpful assistant."
+                "You are Chroma, an advanced virtual human created by the FlashLabs. You possess the ability to understand auditory inputs and generate both text and speech."
             else
                 systemPrompt.Trim()
 

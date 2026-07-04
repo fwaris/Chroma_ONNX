@@ -23,10 +23,11 @@ type S2sRuntimeOptions() =
     member val StreamMinFreeVramMb = 2048 with get, set
     member val CodecStallGuardFrames = 16 with get, set
     member val GenerationMode = "sample" with get, set
-    member val SamplingTemperature = 0.8 with get, set
-    member val SamplingTopP = 0.95 with get, set
+    member val SamplingTemperature = 0.7 with get, set
+    member val SamplingTopP = 0.9 with get, set
     member val SamplingTopK = 50 with get, set
     member val MaxQueueLength = 32 with get, set
+    member val MaxNewFrames = 900 with get, set
     member val MaxPromptAudioSeconds = 60.0 with get, set
     member val MaxTurnAudioSeconds = 60.0 with get, set
     member val MaxHistoryTurns = 2 with get, set
@@ -211,6 +212,7 @@ type S2sRuntimeStatus =
       SamplingTemperature: float
       SamplingTopP: float
       SamplingTopK: int
+      MaxNewFrames: int
       MaxPromptAudioSeconds: float
       MaxTurnAudioSeconds: float
       MaxHistoryTurns: int

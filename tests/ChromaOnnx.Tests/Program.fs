@@ -209,6 +209,7 @@ module Program =
                   SamplingTemperature = 1.0
                   SamplingTopP = 1.0
                   SamplingTopK = 0
+                  MaxNewFrames = 900
                   MaxPromptAudioSeconds = 60.0
                   MaxTurnAudioSeconds = 60.0
                   MaxHistoryTurns = 2
@@ -360,7 +361,7 @@ module Program =
 
     let private multipartSessionContent backend =
         let content = new MultipartFormDataContent()
-        content.Add(new StringContent("You are a helpful assistant."), "systemPrompt")
+        content.Add(new StringContent("You are Chroma, an advanced virtual human created by the FlashLabs. You possess the ability to understand auditory inputs and generate both text and speech."), "systemPrompt")
         content.Add(new StringContent("Reference text."), "promptText")
         content.Add(new StringContent(backend), "backend")
         content.Add(new StringContent("4"), "maxNewFrames")
@@ -493,8 +494,8 @@ module Program =
         assertEqual "default cuda memory cap" 15360 defaults.CudaGpuMemLimitMb.Value
         assertEqual "default stream frames" 4 defaults.StreamDecodeFrames
         assertEqual "default generation mode" "sample" defaults.GenerationMode
-        assertEqual "default sampling temperature" 0.8 defaults.SamplingTemperature
-        assertEqual "default sampling top p" 0.95 defaults.SamplingTopP
+        assertEqual "default sampling temperature" 0.7 defaults.SamplingTemperature
+        assertEqual "default sampling top p" 0.9 defaults.SamplingTopP
         assertEqual "default sampling top k" 50 defaults.SamplingTopK
         assertEqual "default max queue" 32 defaults.MaxQueueLength
         assertEqual "default max history turns" 2 defaults.MaxHistoryTurns
