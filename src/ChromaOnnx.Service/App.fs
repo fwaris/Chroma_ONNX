@@ -5,6 +5,7 @@ open System.IO
 open System.Net.WebSockets
 open System.Text
 open System.Text.Json
+open System.Text.Json.Nodes
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Builder
@@ -19,6 +20,11 @@ module S2sWebApp =
     let bindOptions (configuration: IConfiguration) =
         let options = S2sRuntimeOptions()
         configuration.GetSection("ChromaOnnx:S2s").Bind(options)
+        options
+
+    let bindGemmaOptions (configuration: IConfiguration) =
+        let options = GemmaRuntimeOptions()
+        configuration.GetSection("ChromaOnnx:Gemma").Bind(options)
         options
 
     let private indexHtml =
@@ -38,7 +44,7 @@ module S2sWebApp =
     form { padding: 18px 22px; background: var(--panel); border-right: 1px solid var(--line); display: grid; gap: 13px; align-content: start; }
     label { display: grid; gap: 6px; font-weight: 650; }
     input, textarea, button { font: inherit; }
-    textarea, input[type=file], input[type=number] { width: 100%; border: 1px solid #cbd4dd; border-radius: 6px; padding: 9px 10px; background: white; }
+    textarea, input[type=file], input[type=number], select { width: 100%; border: 1px solid #cbd4dd; border-radius: 6px; padding: 9px 10px; background: white; }
     textarea { min-height: 82px; resize: vertical; }
     button { border: 0; border-radius: 6px; padding: 10px 13px; background: var(--accent); color: white; font-weight: 750; cursor: pointer; }
     button:disabled { opacity: .6; cursor: wait; }
@@ -66,6 +72,10 @@ module S2sWebApp =
   </header>
   <main>
     <form id="sessionForm">
+      <label>Mode<select id="conversationMode">
+        <option value="s2s" selected>Chroma only</option>
+        <option value="agent">Gemma + Chroma</option>
+      </select></label>
       <label>System prompt<textarea id="systemPrompt">You are Chroma, an advanced virtual human created by the FlashLabs. You possess the ability to understand auditory inputs and generate both text and speech.</textarea></label>
       <label>Reference text<textarea id="promptText" required>Why don't skeletons fight each other. They don't have the guts.</textarea></label>
       <label>Reference audio<input id="promptPcm" type="file" accept="audio/*,.f32"></label>
@@ -106,6 +116,7 @@ module S2sWebApp =
     const frameMetric = document.getElementById('frameMetric');
     const streamMetric = document.getElementById('streamMetric');
     const inputMode = document.getElementById('inputMode');
+    const conversationMode = document.getElementById('conversationMode');
     const turnFileLabel = document.getElementById('turnFileLabel');
     const micSecondsLabel = document.getElementById('micSecondsLabel');
     let audioContext = null;
@@ -287,10 +298,30 @@ module S2sWebApp =
         case 'audio.deferred':
           message.textContent = 'Audio decode deferred';
           break;
+        case 'agent.transcription':
+          message.textContent = `Transcript: ${payload.transcript || ''}`;
+          break;
+        case 'agent.tool_call':
+          message.textContent = `Tool: ${payload.name || ''}`;
+          break;
+        case 'agent.tool_result':
+          message.textContent = payload.success ? `Tool result: ${payload.name || ''}` : `Tool failed: ${payload.name || ''}`;
+          break;
+        case 'agent.final_text':
+          message.textContent = payload.text || 'Final text ready';
+          break;
+        case 'agent.vocalization.started':
+          message.textContent = 'Vocalizing with Chroma';
+          break;
+        case 'agent.done':
+          message.textContent = `Agent done: turn ${payload.turnIndex || ''}`;
+          setBusy(false);
+          break;
         case 'generation.done':
           message.textContent = `Done: turn ${payload.turnIndex || ''}`;
           showResult(payload);
-          setBusy(false);
+          if (conversationMode.value === 's2s') currentSession = null;
+          if (conversationMode.value === 's2s') setBusy(false);
           break;
         case 'error':
           message.textContent = payload.message || 'Error';
@@ -304,7 +335,8 @@ module S2sWebApp =
       try {
         const response = await fetch('/api/status');
         const status = await response.json();
-        runtime.textContent = status.ready ? `${status.executionProvider} ${status.memoryMode} ${status.generationMode}` : status.message;
+        const agent = status.agent ? ` | agent ${status.agent.ready ? 'ready' : 'not ready'}` : '';
+        runtime.textContent = status.ready ? `${status.executionProvider} ${status.memoryMode} ${status.generationMode}/${status.samplingAlgorithm}${agent}` : `${status.message}${agent}`;
         runtime.className = status.ready ? '' : 'bad';
       } catch (error) {
         runtime.textContent = error.message;
@@ -328,7 +360,8 @@ module S2sWebApp =
       formData.set('backend', 'fsharp_onnx');
       formData.set('maxNewFrames', String(Math.max(1, Math.ceil(maxSeconds / 0.08))));
       formData.set('promptPcm24k', new Blob([promptBytes], { type: 'application/octet-stream' }), 'prompt.f32');
-      const sessionResponse = await fetch('/api/s2s/sessions', { method: 'POST', body: formData });
+      const endpoint = conversationMode.value === 'agent' ? '/api/agent/sessions' : '/api/s2s/sessions';
+      const sessionResponse = await fetch(endpoint, { method: 'POST', body: formData });
       const session = await sessionResponse.json();
       if (!sessionResponse.ok) throw new Error(session.error || 'Failed to create session.');
       currentSession = session;
@@ -438,6 +471,14 @@ module S2sWebApp =
     });
 
     inputMode.addEventListener('change', updateMode);
+    conversationMode.addEventListener('change', () => {
+      closeConversationSocket('mode changed');
+      currentSession = null;
+      audioResults.innerHTML = '';
+      details.textContent = '{}';
+      message.classList.remove('bad');
+      message.textContent = 'Idle';
+    });
     updateMode();
     loadStatus();
     fetch(defaultPromptTextUrl, { cache: 'no-store' })
@@ -575,15 +616,13 @@ module S2sWebApp =
            streamMinFreeVramMb = status.StreamMinFreeVramMb
            codecStallGuardFrames = status.CodecStallGuardFrames
            generationMode = status.GenerationMode
+           samplingAlgorithm = status.SamplingAlgorithm
            samplingTemperature = status.SamplingTemperature
            samplingTopP = status.SamplingTopP
            samplingTopK = status.SamplingTopK
            maxNewFrames = status.MaxNewFrames
            maxPromptAudioSeconds = status.MaxPromptAudioSeconds
            maxTurnAudioSeconds = status.MaxTurnAudioSeconds
-           maxHistoryTurns = status.MaxHistoryTurns
-           maxHistoryAudioSeconds = status.MaxHistoryAudioSeconds
-           includeAssistantAudioInHistory = status.IncludeAssistantAudioInHistory
            globalGpuMemory = optionToObj status.GlobalGpuMemory
            peakPrivateGb = status.PeakPrivateGb
            peakWorkingSetGb = status.PeakWorkingSetGb
@@ -597,10 +636,49 @@ module S2sWebApp =
            availableGraphs = status.AvailableGraphs
            promptSampleRate = status.PromptSampleRate
            thinkerSampleRate = status.ThinkerSampleRate
+           bundleGraphMode = status.BundleGraphMode
+           bundleThinkerFeatureMode = status.BundleThinkerFeatureMode
+           thinkerMaxAudioItems = status.ThinkerMaxAudioItems
            thinkerFeatureMode = status.ThinkerFeatureMode
            thinkerConfiguredActiveFrames = status.ThinkerConfiguredActiveFrames
            thinkerTraceFeatureFrames = status.ThinkerTraceFeatureFrames
            thinkerTraceSamples = status.ThinkerTraceSamples |}
+
+    let private agentStatusPayload (agent: IAgentRuntime) =
+        let status = agent.Status()
+        {| ready = status.Ready
+           serviceName = status.ServiceName
+           mode = status.Mode
+           modelDir = status.ModelDir
+           variant = status.Variant
+           executionProvider = status.ExecutionProvider
+           maxAudioSeconds = status.MaxAudioSeconds
+           asrMaxNewTokens = status.AsrMaxNewTokens
+           reasoningMaxNewTokens = status.ReasoningMaxNewTokens
+           toolMaxRounds = status.ToolMaxRounds
+           maxHistoryTurns = status.MaxHistoryTurns
+           chromaReady = status.ChromaReady
+           gemma =
+            {| ready = status.Gemma.Ready
+               modelDir = status.Gemma.ModelDir
+               variant = status.Gemma.Variant
+               executionProvider = status.Gemma.ExecutionProvider
+               missingFiles = status.Gemma.MissingFiles
+               loadedSessions = status.Gemma.LoadedSessions
+               message = status.Gemma.Message |}
+           message = status.Message |}
+
+    let private combinedStatusPayload (runtime: IS2sRuntime) (agent: IAgentRuntime) =
+        let node =
+            match JsonSerializer.SerializeToNode(statusPayload runtime, jsonOptions) with
+            | :? JsonObject as value -> value
+            | null -> JsonObject()
+            | value ->
+                let fallback = JsonObject()
+                fallback["s2s"] <- value
+                fallback
+        node["agent"] <- JsonSerializer.SerializeToNode(agentStatusPayload agent, jsonOptions)
+        node :> JsonNode
 
     let private createSession (runtime: IS2sRuntime) (ctx: HttpContext) =
         task {
@@ -633,6 +711,43 @@ module S2sWebApp =
                                 { PromptText = promptText
                                   SystemPrompt = systemPrompt
                                   Backend = backend
+                                  PromptAudio24k = promptAudio
+                                  MaxNewFrames = maxNewFrames }
+                        do! writeJson ctx 200 session
+                with
+                | :? ArgumentException as ex -> do! writeJson ctx 400 (error 400 ex.Message)
+                | ex -> do! writeJson ctx 500 (error 500 ex.Message)
+        }
+
+    let private createAgentSession (runtime: IS2sRuntime) (agent: IAgentRuntime) (ctx: HttpContext) =
+        task {
+            if not ctx.Request.HasFormContentType then
+                do! writeJson ctx 400 (error 400 "Expected multipart/form-data.")
+            else
+                try
+                    let! form = ctx.Request.ReadFormAsync()
+                    let promptText = form["promptText"].ToString()
+                    let systemPrompt = form["systemPrompt"].ToString()
+                    let maxNewFrames =
+                        match Int32.TryParse(form["maxNewFrames"].ToString()) with
+                        | true, value -> max 1 value
+                        | false, _ -> 450
+                    let promptAudioBytes = readFormFileBytes form "promptPcm24k"
+                    let maxPromptBytes = runtime.MaxPromptAudioSamples * sizeof<float32>
+                    if promptAudioBytes.Length > maxPromptBytes then
+                        do!
+                            writeJson
+                                ctx
+                                413
+                                (error
+                                    413
+                                    $"promptPcm24k is too large. The configured maximum is {runtime.MaxPromptAudioSamples} Float32 samples.")
+                    else
+                        let promptAudio = float32PcmFromBytes promptAudioBytes
+                        let session =
+                            agent.CreateSession
+                                { PromptText = promptText
+                                  SystemPrompt = systemPrompt
                                   PromptAudio24k = promptAudio
                                   MaxNewFrames = maxNewFrames }
                         do! writeJson ctx 200 session
@@ -688,12 +803,13 @@ module S2sWebApp =
                                streamMinFreeVramMb = runtimeStatus.StreamMinFreeVramMb
                                codecStallGuardFrames = runtimeStatus.CodecStallGuardFrames
                                generationMode = runtimeStatus.GenerationMode
+                               samplingAlgorithm = runtimeStatus.SamplingAlgorithm
                                samplingTemperature = runtimeStatus.SamplingTemperature
                                samplingTopP = runtimeStatus.SamplingTopP
                                samplingTopK = runtimeStatus.SamplingTopK
-                               maxHistoryTurns = runtimeStatus.MaxHistoryTurns
-                               maxHistoryAudioSeconds = runtimeStatus.MaxHistoryAudioSeconds
-                               includeAssistantAudioInHistory = runtimeStatus.IncludeAssistantAudioInHistory
+                               bundleGraphMode = runtimeStatus.BundleGraphMode
+                               bundleThinkerFeatureMode = runtimeStatus.BundleThinkerFeatureMode
+                               thinkerMaxAudioItems = runtimeStatus.ThinkerMaxAudioItems
                                cudaGpuMemLimitMb = runtimeStatus.CudaGpuMemLimitMb
                                queueLength = runtimeStatus.QueueLength
                                maxQueueLength = runtimeStatus.MaxQueueLength |}
@@ -778,9 +894,6 @@ module S2sWebApp =
                                                                id = session.Id
                                                                requestId = requestId
                                                                turnIndex = context.TurnIndex
-                                                               historyTurnsUsed = context.HistoryTurnsUsed
-                                                               historyAudioSeconds = context.HistoryAudioSeconds
-                                                               historyDropped = context.HistoryDropped
                                                                backend = session.Backend
                                                                backends = [| "fsharp_onnx" |]
                                                                maxNewFrames = maxNewFrames
@@ -832,9 +945,6 @@ module S2sWebApp =
                                                                id = result.Id
                                                                requestId = result.RequestId
                                                                turnIndex = result.TurnIndex
-                                                               historyTurnsUsed = result.HistoryTurnsUsed
-                                                               historyAudioSeconds = result.HistoryAudioSeconds
-                                                               historyDropped = result.HistoryDropped
                                                                backend = result.Backend
                                                                audioUrl = result.AudioUrl
                                                                detailsUrl = result.DetailsUrl
@@ -855,8 +965,9 @@ module S2sWebApp =
                                                       RequestId = None },
                                                     emit,
                                                     socketCancellation.Token
-                                                )
+                                            )
                                             turnAudio.SetLength(0L)
+                                            running <- false
                                         with
                                         | :? OperationCanceledException ->
                                             running <- false
@@ -868,6 +979,297 @@ module S2sWebApp =
                                     do! sendJsonLocked {| ``type`` = "error"; message = $"Unknown WebSocket event '{eventType}'." |}
                             with ex ->
                                 do! sendJsonLocked {| ``type`` = "error"; message = ex.Message; bundle = statusPayload runtime |}
+                        | _ ->
+                            do! sendJsonLocked {| ``type`` = "error"; message = $"Unsupported WebSocket message type {messageType}." |}
+
+                    if socket.State = WebSocketState.Open || socket.State = WebSocketState.CloseReceived then
+                        do! socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "done", CancellationToken.None)
+        }
+
+    let private handleAgentSocket (runtime: IS2sRuntime) (agent: IAgentRuntime) (ctx: HttpContext) =
+        task {
+            let sessionId = routeValue ctx "id"
+            if not ctx.WebSockets.IsWebSocketRequest then
+                do! writeJson ctx 400 (error 400 "Expected WebSocket request.")
+            elif not (safeId sessionId) then
+                do! writeJson ctx 400 (error 400 "Invalid session id.")
+            else
+                match agent.TryGetSession sessionId with
+                | None -> do! writeJson ctx 404 (error 404 "Agent session was not found.")
+                | Some session ->
+                    use! socket = ctx.WebSockets.AcceptWebSocketAsync()
+                    use sendLock = new SemaphoreSlim(1, 1)
+                    use socketCancellation = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted)
+                    let sendJsonLocked payload =
+                        task {
+                            do! sendLock.WaitAsync()
+                            try
+                                if socket.State = WebSocketState.Open then
+                                    do! sendJson socket payload
+                            finally
+                                sendLock.Release() |> ignore
+                        }
+                    let sendBinaryLocked payload =
+                        task {
+                            do! sendLock.WaitAsync()
+                            try
+                                if socket.State = WebSocketState.Open then
+                                    do! sendBinary socket payload
+                            finally
+                                sendLock.Release() |> ignore
+                        }
+                    let trySendJsonLocked payload =
+                        task {
+                            try do! sendJsonLocked payload with _ -> ()
+                        }
+
+                    let agentStatus = agent.Status()
+                    do!
+                        sendJsonLocked
+                            {| ``type`` = "session.ready"
+                               id = session.Id
+                               mode = "agent"
+                               maxNewFrames = session.MaxNewFrames
+                               maxTurnAudioSamples = agent.MaxTurnAudioSamples
+                               gemmaReady = agentStatus.Gemma.Ready
+                               gemmaMessage = agentStatus.Gemma.Message
+                               toolMaxRounds = agentStatus.ToolMaxRounds
+                               maxHistoryTurns = agentStatus.MaxHistoryTurns |}
+
+                    use turnAudio = new MemoryStream()
+                    let mutable running = true
+                    while running && socket.State = WebSocketState.Open do
+                        let! messageType, payload = receiveMessage socket
+                        match messageType with
+                        | WebSocketMessageType.Close ->
+                            socketCancellation.Cancel()
+                            running <- false
+                        | WebSocketMessageType.Binary ->
+                            let maxTurnBytes = int64 agent.MaxTurnAudioSamples * int64 sizeof<float32>
+                            if turnAudio.Length + int64 payload.Length > maxTurnBytes then
+                                socketCancellation.Cancel()
+                                running <- false
+                                do!
+                                    sendJsonLocked
+                                        {| ``type`` = "error"
+                                           message = $"User turn audio is too large. The configured maximum is {agent.MaxTurnAudioSamples} Float32 samples." |}
+                            else
+                                turnAudio.Write(payload, 0, payload.Length)
+                                do! sendJsonLocked {| ``type`` = "turn.chunk"; bytes = payload.Length; totalBytes = turnAudio.Length |}
+                        | WebSocketMessageType.Text ->
+                            try
+                                let text = Encoding.UTF8.GetString(payload)
+                                use doc = JsonDocument.Parse(text)
+                                let eventType =
+                                    match doc.RootElement.TryGetProperty("type") with
+                                    | true, value -> value.GetString()
+                                    | _ -> null
+
+                                match eventType with
+                                | "turn.start" ->
+                                    turnAudio.SetLength(0L)
+                                    do! sendJsonLocked {| ``type`` = "turn.accepted"; id = session.Id |}
+                                | "turn.cancel" ->
+                                    socketCancellation.Cancel()
+                                    running <- false
+                                    do! trySendJsonLocked {| ``type`` = "generation.canceled"; id = session.Id |}
+                                | "turn.end" ->
+                                    let turnAudioBytes = turnAudio.ToArray()
+                                    if turnAudioBytes.Length = 0 then
+                                        do! sendJsonLocked {| ``type`` = "error"; message = "User turn audio is required before turn.end." |}
+                                    else
+                                        let userAudio = float32PcmFromBytes turnAudioBytes
+                                        let emit event =
+                                            task {
+                                                match event with
+                                                | AgentTranscription(id, requestId, turnIndex, transcript) ->
+                                                    do!
+                                                        sendJsonLocked
+                                                            {| ``type`` = "agent.transcription"
+                                                               id = id
+                                                               requestId = requestId
+                                                               turnIndex = turnIndex
+                                                               transcript = transcript |}
+                                                | AgentToolCall(id, requestId, turnIndex, call) ->
+                                                    do!
+                                                        sendJsonLocked
+                                                            {| ``type`` = "agent.tool_call"
+                                                               id = id
+                                                               requestId = requestId
+                                                               turnIndex = turnIndex
+                                                               round = call.Round
+                                                               name = call.Name
+                                                               arguments = call.Arguments
+                                                               rawText = call.RawText |}
+                                                | AgentToolResult(id, requestId, turnIndex, result) ->
+                                                    do!
+                                                        sendJsonLocked
+                                                            {| ``type`` = "agent.tool_result"
+                                                               id = id
+                                                               requestId = requestId
+                                                               turnIndex = turnIndex
+                                                               round = result.Round
+                                                               name = result.Name
+                                                               success = result.Success
+                                                               result = result.Result
+                                                               error = nullableString result.Error |}
+                                                | AgentFinalText(id, requestId, turnIndex, finalText) ->
+                                                    do!
+                                                        sendJsonLocked
+                                                            {| ``type`` = "agent.final_text"
+                                                               id = id
+                                                               requestId = requestId
+                                                               turnIndex = turnIndex
+                                                               text = finalText |}
+                                                | AgentVocalizationStarted(id, requestId, turnIndex, chromaSessionId) ->
+                                                    do!
+                                                        sendJsonLocked
+                                                            {| ``type`` = "agent.vocalization.started"
+                                                               id = id
+                                                               requestId = requestId
+                                                               turnIndex = turnIndex
+                                                               chromaSessionId = chromaSessionId |}
+                                                | AgentChromaEvent chromaEvent ->
+                                                    match chromaEvent with
+                                                    | QueueEnqueued(requestId, snapshot) ->
+                                                        do!
+                                                            sendJsonLocked
+                                                                {| ``type`` = "queue.enqueued"
+                                                                   id = session.Id
+                                                                   requestId = requestId
+                                                                   position = snapshot.Position
+                                                                   queueLength = snapshot.QueueLength
+                                                                   runningId = nullableString snapshot.RunningId
+                                                                   maxQueueLength = runtime.MaxQueueLength |}
+                                                    | QueueUpdated snapshot ->
+                                                        do!
+                                                            sendJsonLocked
+                                                                {| ``type`` = "queue.updated"
+                                                                   id = session.Id
+                                                                   requestId = snapshot.Id
+                                                                   position = snapshot.Position
+                                                                   queueLength = snapshot.QueueLength
+                                                                   runningId = nullableString snapshot.RunningId
+                                                                   isRunning = snapshot.IsRunning |}
+                                                    | QueueStarted(requestId, queueLength) ->
+                                                        do!
+                                                            sendJsonLocked
+                                                                {| ``type`` = "queue.started"
+                                                                   id = session.Id
+                                                                   requestId = requestId
+                                                                   queueLength = queueLength |}
+                                                    | GenerationStarted(requestId, maxNewFrames, streamDecodeFrames, streamMinFreeVramMb, codecStallGuardFrames, context) ->
+                                                        do!
+                                                            sendJsonLocked
+                                                                {| ``type`` = "generation.started"
+                                                                   id = session.Id
+                                                                   requestId = requestId
+                                                                   turnIndex = context.TurnIndex
+                                                                   backend = "fsharp_onnx"
+                                                                   backends = [| "fsharp_onnx" |]
+                                                                   maxNewFrames = maxNewFrames
+                                                                   streamDecodeFrames = streamDecodeFrames
+                                                                   streamMinFreeVramMb = streamMinFreeVramMb
+                                                                   codecStallGuardFrames = codecStallGuardFrames |}
+                                                    | GenerationFrame(requestId, frame) ->
+                                                        do!
+                                                            sendJsonLocked
+                                                                {| ``type`` = "generation.frame"
+                                                                   id = session.Id
+                                                                   requestId = requestId
+                                                                   frameIndex = frame.FrameIndex
+                                                                   stepKind = frame.StepKind
+                                                                   isEos = frame.IsEos
+                                                                   codes = frame.Codes |}
+                                                    | AudioChunk(requestId, chunk) ->
+                                                        let bytes = ChromaOnnx.AudioChunk.float32ToLittleEndianBytes chunk.Samples
+                                                        do!
+                                                            sendJsonLocked
+                                                                {| ``type`` = "audio.chunk"
+                                                                   id = session.Id
+                                                                   requestId = requestId
+                                                                   chunkIndex = chunk.ChunkIndex
+                                                                   startFrame = chunk.StartFrame
+                                                                   frameCount = chunk.FrameCount
+                                                                   startSample = chunk.StartSample
+                                                                   sampleRate = chunk.SampleRate
+                                                                   sampleCount = chunk.Samples.Length
+                                                                   byteLength = bytes.Length
+                                                                   format = "f32le" |}
+                                                        do! sendBinaryLocked bytes
+                                                    | AudioDeferred(requestId, deferred) ->
+                                                        do!
+                                                            sendJsonLocked
+                                                                {| ``type`` = "audio.deferred"
+                                                                   id = session.Id
+                                                                   requestId = requestId
+                                                                   frameCount = deferred.FrameCount
+                                                                   freeVramMb = deferred.FreeVramMb
+                                                                   usedVramMb = deferred.UsedVramMb
+                                                                   totalVramMb = deferred.TotalVramMb
+                                                                   minFreeVramMb = deferred.MinFreeVramMb
+                                                                   message = deferred.Message |}
+                                                    | GenerationDone result ->
+                                                        do!
+                                                            sendJsonLocked
+                                                                {| ``type`` = "generation.done"
+                                                                   id = session.Id
+                                                                   requestId = result.RequestId
+                                                                   turnIndex = result.TurnIndex
+                                                                   backend = result.Backend
+                                                                   audioUrl = result.AudioUrl
+                                                                   detailsUrl = result.DetailsUrl
+                                                                   results = result.Results |> Array.map (fun item -> item.Details) |}
+                                                    | GenerationCanceled(id, requestId) ->
+                                                        do!
+                                                            sendJsonLocked
+                                                                {| ``type`` = "generation.canceled"
+                                                                   id = id
+                                                                   requestId = nullableString requestId |}
+                                                | AgentDone result ->
+                                                    do!
+                                                        sendJsonLocked
+                                                            {| ``type`` = "agent.done"
+                                                               id = result.Id
+                                                               requestId = result.RequestId
+                                                               turnIndex = result.TurnIndex
+                                                               transcript = result.Transcript
+                                                               finalText = result.FinalText
+                                                               chromaSessionId = nullableString result.ChromaSessionId
+                                                               chromaTurnIndex = optionToObj result.ChromaTurnIndex
+                                                               audioUrl = nullableString result.AudioUrl
+                                                               detailsUrl = result.DetailsUrl
+                                                               toolCalls = result.ToolCalls
+                                                               toolResults = result.ToolResults |}
+                                                | AgentCanceled(id, requestId) ->
+                                                    do!
+                                                        sendJsonLocked
+                                                            {| ``type`` = "generation.canceled"
+                                                               id = id
+                                                               requestId = nullableString requestId |}
+                                            }
+                                            :> Task
+                                        try
+                                            let! _ =
+                                                agent.RunTurnAsync(
+                                                    { SessionId = session.Id
+                                                      UserAudio16k = userAudio
+                                                      RequestId = None },
+                                                    emit,
+                                                    socketCancellation.Token
+                                                )
+                                            turnAudio.SetLength(0L)
+                                        with
+                                        | :? OperationCanceledException ->
+                                            running <- false
+                                            do! trySendJsonLocked {| ``type`` = "generation.canceled"; id = session.Id |}
+                                        | ex ->
+                                            running <- false
+                                            do! trySendJsonLocked {| ``type`` = "error"; message = ex.Message; agent = agentStatusPayload agent |}
+                                | _ ->
+                                    do! sendJsonLocked {| ``type`` = "error"; message = $"Unknown WebSocket event '{eventType}'." |}
+                            with ex ->
+                                do! sendJsonLocked {| ``type`` = "error"; message = ex.Message; agent = agentStatusPayload agent |}
                         | _ ->
                             do! sendJsonLocked {| ``type`` = "error"; message = $"Unsupported WebSocket message type {messageType}." |}
 
@@ -905,15 +1307,48 @@ module S2sWebApp =
                         do! ctx.Response.SendFileAsync(artifact.Path)
         }
 
-    let map (app: WebApplication) (runtime: IS2sRuntime) =
+    let private serveAgentTurnArtifact (agent: IAgentRuntime) fileName (ctx: HttpContext) =
+        task {
+            let sessionId = routeValue ctx "id"
+            let turnIndexText = routeValue ctx "turnIndex"
+            match Int32.TryParse(turnIndexText) with
+            | false, _ -> do! writeJson ctx 400 (error 400 "Invalid turn index.")
+            | true, turnIndex ->
+                if not (safeId sessionId) || turnIndex < 1 then
+                    do! writeJson ctx 400 (error 400 "Invalid session id or turn index.")
+                else
+                    match agent.TryGetTurnArtifact(sessionId, turnIndex, fileName) with
+                    | None -> do! writeJson ctx 404 (error 404 $"Agent turn artifact {fileName} was not found.")
+                    | Some artifact ->
+                        ctx.Response.ContentType <- artifact.ContentType
+                        do! ctx.Response.SendFileAsync(artifact.Path)
+        }
+
+    let private mapCore (app: WebApplication) (runtime: IS2sRuntime) (agent: IAgentRuntime option) =
         app.UseWebSockets() |> ignore
         app.MapGet("/", RequestDelegate(fun ctx -> task { do! writeText ctx "text/html; charset=utf-8" indexHtml })) |> ignore
         app.MapGet("/assets/southern_belle.mp3", RequestDelegate(fun ctx -> serveAsset "southern_belle.mp3" "audio/mpeg" ctx)) |> ignore
         app.MapGet("/assets/southern_belle_prompt.txt", RequestDelegate(fun ctx -> serveAsset "southern_belle_prompt.txt" "text/plain; charset=utf-8" ctx)) |> ignore
         app.MapGet("/healthz", RequestDelegate(fun ctx -> writeJson ctx 200 {| ok = true |})) |> ignore
-        app.MapGet("/api/status", RequestDelegate(fun ctx -> writeJson ctx 200 (statusPayload runtime))) |> ignore
+        app.MapGet(
+            "/api/status",
+            RequestDelegate(fun ctx ->
+                task {
+                    match agent with
+                    | Some agentRuntime ->
+                        do! writeJson ctx 200 (combinedStatusPayload runtime agentRuntime)
+                    | None -> do! writeJson ctx 200 (statusPayload runtime)
+                })
+        )
+        |> ignore
         app.MapPost("/api/s2s/sessions", RequestDelegate(fun ctx -> createSession runtime ctx)) |> ignore
         app.MapGet("/ws/s2s/{id}", RequestDelegate(fun ctx -> handleSocket runtime ctx)) |> ignore
+        match agent with
+        | Some agentRuntime ->
+            app.MapPost("/api/agent/sessions", RequestDelegate(fun ctx -> createAgentSession runtime agentRuntime ctx)) |> ignore
+            app.MapGet("/ws/agent/{id}", RequestDelegate(fun ctx -> handleAgentSocket runtime agentRuntime ctx)) |> ignore
+            app.MapGet("/api/agent/sessions/{id}/turns/{turnIndex}/details.json", RequestDelegate(fun ctx -> serveAgentTurnArtifact agentRuntime "details.json" ctx)) |> ignore
+        | None -> ()
         app.MapGet("/api/s2s/sessions/{id}/turns/{turnIndex}/details.json", RequestDelegate(fun ctx -> serveTurnArtifact runtime None "details.json" ctx)) |> ignore
         app.MapGet("/api/s2s/sessions/{id}/turns/{turnIndex}/{backend}/details.json", RequestDelegate(fun ctx -> serveTurnArtifact runtime (Some(routeValue ctx "backend")) "details.json" ctx)) |> ignore
         app.MapGet("/api/s2s/sessions/{id}/turns/{turnIndex}/{backend}/audio.wav", RequestDelegate(fun ctx -> serveTurnArtifact runtime (Some(routeValue ctx "backend")) "audio.wav" ctx)) |> ignore
@@ -922,3 +1357,9 @@ module S2sWebApp =
         app.MapGet("/api/s2s/sessions/{id}/{backend}/details.json", RequestDelegate(fun ctx -> serveArtifact runtime (Some(routeValue ctx "backend")) "details.json" ctx)) |> ignore
         app.MapGet("/api/s2s/sessions/{id}/{backend}/audio.wav", RequestDelegate(fun ctx -> serveArtifact runtime (Some(routeValue ctx "backend")) "audio.wav" ctx)) |> ignore
         app
+
+    let map (app: WebApplication) (runtime: IS2sRuntime) =
+        mapCore app runtime None
+
+    let mapWithAgent (app: WebApplication) (runtime: IS2sRuntime) (agent: IAgentRuntime) =
+        mapCore app runtime (Some agent)

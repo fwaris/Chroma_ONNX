@@ -22,25 +22,10 @@ type private RuntimeSession =
       CreatedUtc: DateTimeOffset
       WorkDir: string
       SyncRoot: obj
-      Turns: ResizeArray<RuntimeTurn>
-      mutable NextTurnIndex: int
-      mutable LastDetails: JsonElement option }
-
-and private RuntimeTurn =
-    { TurnIndex: int
-      RequestId: string
-      UserAudio16k: float32 array
-      AssistantAudio24k: float32 array
-      AssistantAudio16k: float32 array
-      WorkDir: string }
+      mutable NextTurnIndex: int }
 
 type private RuntimeBackendOutput =
-    { Result: S2sBackendResult
-      Audio24k: float32 array }
-
-type private RuntimeContextSelection =
-    { Context: S2sTurnContext
-      ConversationAudios: NativeS2sConversationAudio array }
+    { Result: S2sBackendResult }
 
 type private RuntimeSessionStore(workDir: string, promptSampleRate: int, runtimeMode: string) =
     let sessions = ConcurrentDictionary<string, RuntimeSession>(StringComparer.Ordinal)
@@ -78,9 +63,7 @@ type private RuntimeSessionStore(workDir: string, promptSampleRate: int, runtime
               CreatedUtc = DateTimeOffset.UtcNow
               WorkDir = sessionDir
               SyncRoot = obj ()
-              Turns = ResizeArray<RuntimeTurn>()
-              NextTurnIndex = 1
-              LastDetails = None }
+              NextTurnIndex = 1 }
 
         sessions[id] <- session
         session
@@ -118,16 +101,40 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
             invalidArg
                 "GenerationMode"
                 $"Unsupported generation mode '{other}'. Use 'sample' or 'greedy'."
+    let samplingAlgorithm =
+        let text = options.SamplingAlgorithm.Trim().ToLowerInvariant()
+        match text with
+        | ""
+        | "current"
+        | "default"
+        | "top-k-top-p"
+        | "topk-topp"
+        | "top_k_top_p"
+        | "nucleus" -> TopKTopP
+        | "chroma"
+        | "chroma-compatible"
+        | "chroma_compatible"
+        | "chroma-top-k"
+        | "chroma_top_k"
+        | "top-k"
+        | "topk"
+        | "top_k" -> ChromaTopK
+        | other ->
+            invalidArg
+                "SamplingAlgorithm"
+                $"Unsupported sampling algorithm '{other}'. Use 'top-k-top-p' or 'chroma'."
     let finiteOr fallback value =
         if Double.IsNaN value || Double.IsInfinity value then
             fallback
         else
             value
-    let samplingTemperature = Math.Max(0.01, finiteOr 0.7 options.SamplingTemperature)
-    let samplingTopP = Math.Min(1.0, Math.Max(0.01, finiteOr 0.9 options.SamplingTopP))
+    let samplingTemperature = Math.Max(0.0, finiteOr 0.7 options.SamplingTemperature)
+    let samplingTopP = Math.Min(1.0, Math.Max(0.0, finiteOr 0.9 options.SamplingTopP))
     let samplingTopK = max 0 options.SamplingTopK
+    let samplingEnabled = generationMode = "sample" && samplingTemperature > 0.0 && samplingTopK <> 1
     let samplingOptions =
-        { Enabled = generationMode = "sample"
+        { Enabled = samplingEnabled
+          Algorithm = samplingAlgorithm
           Temperature = samplingTemperature
           TopP = samplingTopP
           TopK = samplingTopK }
@@ -145,9 +152,6 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
     let maxNewFrames = max 1 options.MaxNewFrames
     let maxPromptAudioSeconds = Math.Max(0.1, options.MaxPromptAudioSeconds)
     let maxTurnAudioSeconds = Math.Max(0.1, options.MaxTurnAudioSeconds)
-    let maxHistoryTurns = max 0 options.MaxHistoryTurns
-    let maxHistoryAudioSeconds = Math.Max(0.0, options.MaxHistoryAudioSeconds)
-    let includeAssistantAudioInHistory = options.IncludeAssistantAudioInHistory
     let optimizedModelCacheDir =
         if String.IsNullOrWhiteSpace options.OptimizedModelCacheDir then
             None
@@ -165,6 +169,7 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
           CudaGpuMemLimitMb = cudaGpuMemLimitMb }
     let processor = ChromaNativeProcessor(modelDir, options.ThinkerActiveFrames)
     let runner = new ChromaS2sOnnxRunner(modelDir, bundleDir, options.ExecutionProvider, options.MemoryMode, tuningOptions)
+    let thinkerMaxAudioItems = max 1 runner.ThinkerMaxAudioItems
     let store = RuntimeSessionStore(workDir, processor.PromptSampleRate, runtimeMode)
     let workQueue = StreamingWorkQueue(maxQueueLength)
     let maxPromptAudioSamples = int (Math.Ceiling(maxPromptAudioSeconds * float processor.PromptSampleRate))
@@ -211,81 +216,12 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
     let backendDirectory (session: RuntimeSession) turnIndex backend =
         Path.Combine(turnDirectory session turnIndex, backend)
 
-    let tensorToArray (tensor: DenseTensor<float32>) =
-        let count = tensor.Dimensions.ToArray() |> Array.fold (fun total dim -> total * dim) 1
-        let values = Array.zeroCreate<float32> count
-        if count > 0 then
-            tensor.Buffer.Span.Slice(0, count).CopyTo(values.AsSpan())
-        values
-
-    let resampleLinear (sourceRate: int) (targetRate: int) (samples: float32 array) =
-        if samples.Length = 0 || sourceRate = targetRate then
-            samples
-        else
-            let length = max 1 (int (Math.Round(float samples.Length * float targetRate / float sourceRate)))
-            let output = Array.zeroCreate<float32> length
-            let scale = float sourceRate / float targetRate
-            for index in 0 .. length - 1 do
-                let source = float index * scale
-                let left = int (Math.Floor source)
-                let right = min (left + 1) (samples.Length - 1)
-                let mix = source - float left
-                let a = float samples[min left (samples.Length - 1)]
-                let b = float samples[right]
-                output[index] <- float32 (a * (1.0 - mix) + b * mix)
-            output
-
-    let reserveTurnIndex (session: RuntimeSession) =
+    let reserveSingleTurnIndex (session: RuntimeSession) =
         lock session.SyncRoot (fun () ->
-            let turnIndex = session.NextTurnIndex
-            session.NextTurnIndex <- turnIndex + 1
-            turnIndex)
-
-    let completedTurns (session: RuntimeSession) =
-        lock session.SyncRoot (fun () -> session.Turns.ToArray())
-
-    let selectContext (session: RuntimeSession) turnIndex (currentUserAudio16k: float32 array) =
-        let completed = completedTurns session |> Array.sortBy _.TurnIndex
-        let mutable totalSamples = currentUserAudio16k.Length
-        let maxHistoryAudioSamples =
-            if maxHistoryAudioSeconds <= 0.0 then
-                0
-            else
-                int (Math.Ceiling(maxHistoryAudioSeconds * float processor.ThinkerSampleRate))
-        let selectedNewestFirst = ResizeArray<RuntimeTurn>()
-
-        for turn in completed |> Array.rev do
-            if selectedNewestFirst.Count < maxHistoryTurns then
-                let assistantSamples =
-                    if includeAssistantAudioInHistory then turn.AssistantAudio16k.Length else 0
-                let turnSamples = turn.UserAudio16k.Length + assistantSamples
-                let withinAudioBudget =
-                    maxHistoryAudioSamples > 0
-                    && totalSamples + turnSamples <= maxHistoryAudioSamples
-                if withinAudioBudget then
-                    selectedNewestFirst.Add(turn)
-                    totalSamples <- totalSamples + turnSamples
-
-        let selected =
-            selectedNewestFirst.ToArray()
-            |> Array.rev
-
-        let conversationAudios = ResizeArray<NativeS2sConversationAudio>()
-        for turn in selected do
-            conversationAudios.Add({ Role = "user"; Audio16k = turn.UserAudio16k })
-            if includeAssistantAudioInHistory && turn.AssistantAudio16k.Length > 0 then
-                conversationAudios.Add({ Role = "assistant"; Audio16k = turn.AssistantAudio16k })
-        conversationAudios.Add({ Role = "user"; Audio16k = currentUserAudio16k })
-
-        { Context =
-            { TurnIndex = turnIndex
-              HistoryTurnsUsed = selected.Length
-              HistoryAudioSeconds = Math.Round(float totalSamples / float processor.ThinkerSampleRate, 3)
-              HistoryDropped = completed.Length - selected.Length }
-          ConversationAudios = conversationAudios.ToArray() }
-
-    let addCompletedTurn (session: RuntimeSession) (turn: RuntimeTurn) =
-        lock session.SyncRoot (fun () -> session.Turns.Add(turn))
+            if session.NextTurnIndex <> 1 then
+                invalidOp "Chroma S2S sessions are single-turn. Create a new session for another Chroma generation."
+            session.NextTurnIndex <- 2
+            1)
 
     let runFsharpBackend
         (session: RuntimeSession)
@@ -319,7 +255,6 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
         let wavPath = Path.Combine(backendDir, "audio.wav")
         TensorIO.writeInt64s codesPath result.AudioCodes
         TensorIO.writeSingles rawAudioPath result.AudioValues
-        let assistantAudio24k = tensorToArray result.AudioValues
         let wavStats = Wave.writeMono16 wavPath 24000 result.AudioValues
         let generationFrameRateFps =
             match result.Timings.TryGetValue "generateMs" with
@@ -328,18 +263,19 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
         let truncatedByMaxFrames = result.StopReason = "max_frames"
         let detailsUrl = $"/api/s2s/sessions/{session.Id}/turns/{context.TurnIndex}/{backend}/details.json"
         let audioUrl = $"/api/s2s/sessions/{session.Id}/turns/{context.TurnIndex}/{backend}/audio.wav"
+        let thinkerFeatureDimensions = prepared.ThinkerInputFeatures.Dimensions.ToArray()
+        let thinkerContextAudioItems =
+            if thinkerFeatureDimensions.Length > 0 then thinkerFeatureDimensions.[0] else 0
         let details =
             {| id = session.Id
                requestId = requestId
                turnIndex = context.TurnIndex
-               historyTurnsUsed = context.HistoryTurnsUsed
-               historyAudioSeconds = context.HistoryAudioSeconds
-               historyDropped = context.HistoryDropped
                backend = backend
                label = backendLabel backend
                mode = backendMode
                generationMode = generationMode
                samplingEnabled = samplingOptions.Enabled
+               samplingAlgorithm = samplingOptions.Algorithm.Name
                samplingTemperature = samplingOptions.Temperature
                samplingTopP = samplingOptions.TopP
                samplingTopK = samplingOptions.TopK
@@ -370,6 +306,10 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
                promptAudioSamples = prepared.PromptAudioSamples
                userAudioSamples = prepared.UserAudioSamples
                effectiveUserAudioSamples = min prepared.UserAudioSamples processor.ThinkerTraceSamples
+               bundleGraphMode = runner.BundleGraphMode
+               bundleThinkerFeatureMode = runner.BundleThinkerFeatureMode
+               thinkerMaxAudioItems = thinkerMaxAudioItems
+               thinkerContextAudioItems = thinkerContextAudioItems
                thinkerFeatureMode = processor.ThinkerFeatureMode
                thinkerConfiguredActiveFrames = processor.ConfiguredThinkerActiveFrames
                thinkerTraceFeatureFrames = processor.ThinkerTraceFeatureFrames
@@ -388,8 +328,7 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
             { Backend = backend
               AudioUrl = audioUrl
               DetailsUrl = detailsUrl
-              Details = detailsElement }
-          Audio24k = assistantAudio24k }
+              Details = detailsElement } }
 
     let tryArtifactPath (session: RuntimeSession) (backend: string option) fileName =
         if not (safeId session.Id) then
@@ -447,15 +386,13 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
               StreamMinFreeVramMb = streamMinFreeVramMb
               CodecStallGuardFrames = codecStallGuardFrames
               GenerationMode = generationMode
+              SamplingAlgorithm = samplingOptions.Algorithm.Name
               SamplingTemperature = samplingOptions.Temperature
               SamplingTopP = samplingOptions.TopP
               SamplingTopK = samplingOptions.TopK
               MaxNewFrames = maxNewFrames
               MaxPromptAudioSeconds = maxPromptAudioSeconds
               MaxTurnAudioSeconds = maxTurnAudioSeconds
-              MaxHistoryTurns = maxHistoryTurns
-              MaxHistoryAudioSeconds = maxHistoryAudioSeconds
-              IncludeAssistantAudioInHistory = includeAssistantAudioInHistory
               GlobalGpuMemory = RuntimeMemory.tryGlobalGpuMemory()
               PeakPrivateGb = runner.PeakPrivateGb
               PeakWorkingSetGb = runner.PeakWorkingSetGb
@@ -469,6 +406,9 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
               AvailableGraphs = status.AvailableGraphs
               PromptSampleRate = processor.PromptSampleRate
               ThinkerSampleRate = processor.ThinkerSampleRate
+              BundleGraphMode = status.BundleGraphMode
+              BundleThinkerFeatureMode = status.BundleThinkerFeatureMode
+              ThinkerMaxAudioItems = status.ThinkerMaxAudioItems
               ThinkerFeatureMode = processor.ThinkerFeatureMode
               ThinkerConfiguredActiveFrames = processor.ConfiguredThinkerActiveFrames
               ThinkerTraceFeatureFrames = processor.ThinkerTraceFeatureFrames
@@ -509,7 +449,7 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
                         request.RequestId
                         |> Option.filter (String.IsNullOrWhiteSpace >> not)
                         |> Option.defaultWith (fun () -> $"{session.Id}_{Guid.NewGuid():N}")
-                    let turnIndex = reserveTurnIndex session
+                    let turnIndex = reserveSingleTurnIndex session
                     let resultSource = TaskCompletionSource<S2sTurnResult>(TaskCreationOptions.RunContinuationsAsynchronously)
                     let emitBlocking event =
                         emit event |> fun work -> work.GetAwaiter().GetResult()
@@ -525,8 +465,7 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
                                 Directory.CreateDirectory(turnDir) |> ignore
                                 File.WriteAllBytes(Path.Combine(turnDir, "user_audio_16k.f32"), turnAudioBytes)
                                 File.WriteAllBytes(Path.Combine(session.WorkDir, "user_audio_16k.f32"), turnAudioBytes)
-                                let contextSelection = selectContext session turnIndex request.UserAudio16k
-                                let context = contextSelection.Context
+                                let context = { TurnIndex = turnIndex }
                                 do!
                                     emit (
                                         GenerationStarted(
@@ -544,7 +483,7 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
                                         session.PromptText,
                                         session.SystemPrompt,
                                         session.PromptAudio24k,
-                                        contextSelection.ConversationAudios,
+                                        [| { Role = "user"; Audio16k = request.UserAudio16k } |],
                                         request.UserAudio16k.Length
                                     )
                                 File.WriteAllText(Path.Combine(turnDir, "conversation.txt"), prepared.ConversationText)
@@ -599,19 +538,14 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
                                 if File.Exists backendAudioPath then
                                     File.Copy(backendAudioPath, Path.Combine(session.WorkDir, "audio.wav"), true)
 
-                                let assistantAudio16k =
-                                    resampleLinear 24000 processor.ThinkerSampleRate backendOutput.Audio24k
-
                                 let details =
                                     {| id = session.Id
                                        requestId = requestId
                                        turnIndex = context.TurnIndex
-                                       historyTurnsUsed = context.HistoryTurnsUsed
-                                       historyAudioSeconds = context.HistoryAudioSeconds
-                                       historyDropped = context.HistoryDropped
                                        mode = runtimeMode
                                        generationMode = generationMode
                                        samplingEnabled = samplingOptions.Enabled
+                                       samplingAlgorithm = samplingOptions.Algorithm.Name
                                        samplingTemperature = samplingOptions.Temperature
                                        samplingTopP = samplingOptions.TopP
                                        samplingTopK = samplingOptions.TopK
@@ -625,23 +559,10 @@ type ChromaS2sRuntime(options: S2sRuntimeOptions) =
                                 let detailsJson = JsonSerializer.Serialize(details, jsonOptions)
                                 File.WriteAllText(Path.Combine(turnDir, "details.json"), detailsJson)
                                 File.WriteAllText(Path.Combine(session.WorkDir, "details.json"), detailsJson)
-                                use doc = JsonDocument.Parse(detailsJson)
-                                session.LastDetails <- Some(doc.RootElement.Clone())
-                                addCompletedTurn
-                                    session
-                                    { TurnIndex = turnIndex
-                                      RequestId = requestId
-                                      UserAudio16k = Array.copy request.UserAudio16k
-                                      AssistantAudio24k = backendOutput.Audio24k
-                                      AssistantAudio16k = assistantAudio16k
-                                      WorkDir = turnDir }
                                 let turnResult =
                                     { Id = session.Id
                                       RequestId = requestId
                                       TurnIndex = context.TurnIndex
-                                      HistoryTurnsUsed = context.HistoryTurnsUsed
-                                      HistoryAudioSeconds = context.HistoryAudioSeconds
-                                      HistoryDropped = context.HistoryDropped
                                       Backend = session.Backend
                                       AudioUrl = backendResult.AudioUrl
                                       DetailsUrl = backendResult.DetailsUrl

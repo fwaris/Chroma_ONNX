@@ -23,6 +23,7 @@ type S2sRuntimeOptions() =
     member val StreamMinFreeVramMb = 2048 with get, set
     member val CodecStallGuardFrames = 16 with get, set
     member val GenerationMode = "sample" with get, set
+    member val SamplingAlgorithm = "top-k-top-p" with get, set
     member val SamplingTemperature = 0.7 with get, set
     member val SamplingTopP = 0.9 with get, set
     member val SamplingTopK = 50 with get, set
@@ -30,9 +31,6 @@ type S2sRuntimeOptions() =
     member val MaxNewFrames = 900 with get, set
     member val MaxPromptAudioSeconds = 60.0 with get, set
     member val MaxTurnAudioSeconds = 60.0 with get, set
-    member val MaxHistoryTurns = 2 with get, set
-    member val MaxHistoryAudioSeconds = 180.0 with get, set
-    member val IncludeAssistantAudioInHistory = true with get, set
 
 module S2sRuntimePaths =
     let private notBlank (value: string | null) =
@@ -148,18 +146,12 @@ type S2sBackendResult =
       Details: JsonElement }
 
 type S2sTurnContext =
-    { TurnIndex: int
-      HistoryTurnsUsed: int
-      HistoryAudioSeconds: float
-      HistoryDropped: int }
+    { TurnIndex: int }
 
 type S2sTurnResult =
     { Id: string
       RequestId: string
       TurnIndex: int
-      HistoryTurnsUsed: int
-      HistoryAudioSeconds: float
-      HistoryDropped: int
       Backend: string
       AudioUrl: string
       DetailsUrl: string
@@ -209,15 +201,13 @@ type S2sRuntimeStatus =
       StreamMinFreeVramMb: int
       CodecStallGuardFrames: int
       GenerationMode: string
+      SamplingAlgorithm: string
       SamplingTemperature: float
       SamplingTopP: float
       SamplingTopK: int
       MaxNewFrames: int
       MaxPromptAudioSeconds: float
       MaxTurnAudioSeconds: float
-      MaxHistoryTurns: int
-      MaxHistoryAudioSeconds: float
-      IncludeAssistantAudioInHistory: bool
       GlobalGpuMemory: RuntimeMemory.GpuGlobalSnapshot option
       PeakPrivateGb: float
       PeakWorkingSetGb: float
@@ -231,6 +221,9 @@ type S2sRuntimeStatus =
       AvailableGraphs: string array
       PromptSampleRate: int
       ThinkerSampleRate: int
+      BundleGraphMode: string
+      BundleThinkerFeatureMode: string
+      ThinkerMaxAudioItems: int
       ThinkerFeatureMode: string
       ThinkerConfiguredActiveFrames: int
       ThinkerTraceFeatureFrames: int

@@ -58,6 +58,12 @@ def parse_args() -> argparse.Namespace:
         help="Active Whisper/thinker feature frames used for S2S export tracing; the exported batch-1 graph keeps the runtime feature mask dynamic.",
     )
     parser.add_argument(
+        "--thinker-audio-items",
+        type=int,
+        default=1,
+        help="Maximum thinker audio segments traced into the S2S prefill graph. Chroma S2S runtime is current-turn-only, so this should stay at 1.",
+    )
+    parser.add_argument(
         "--single-onnx-s2s",
         action="store_true",
         help="For safetensor-shared-s2s, keep only chroma_s2s_merged.weights_free.onnx plus the manifest.",
@@ -105,8 +111,12 @@ def main() -> int:
     shared_bundle = e2e_shared_bundle or s2s_shared_bundle
     if args.thinker_active_frames < 1 or args.thinker_active_frames > thinker_max_frames:
         raise SystemExit(f"--thinker-active-frames must be between 1 and {thinker_max_frames}.")
+    if args.thinker_audio_items < 1:
+        raise SystemExit("--thinker-audio-items must be at least 1.")
     if args.single_onnx_s2s and not s2s_shared_bundle:
         raise SystemExit("--single-onnx-s2s is only valid with --bundle safetensor-shared-s2s.")
+    if s2s_shared_bundle and args.thinker_audio_items != 1:
+        raise SystemExit("--thinker-audio-items must be 1 for the current-turn Chroma S2S export.")
 
     if shared_bundle and (args.skip_system_prefill or args.skip_codec):
         raise SystemExit(f"--bundle {args.bundle} requires system_prefill, decoder, and codec_decode exports.")
@@ -236,7 +246,7 @@ def main() -> int:
 
     if s2s_shared_bundle:
         audio_placeholder_count = 25
-        dummy_thinker_audio_count = 5
+        dummy_thinker_audio_count = int(args.thinker_audio_items)
         dummy_thinker_sequence = max(args.sequence_length, dummy_thinker_audio_count * audio_placeholder_count + 4)
         dummy_thinker_ids = torch.zeros(args.batch, dummy_thinker_sequence, dtype=torch.long, device=args.device)
         for audio_index in range(dummy_thinker_audio_count):
@@ -759,6 +769,7 @@ def main() -> int:
         if s2s_shared_bundle:
             capabilities = {
                 "mode": "s2s_greedy",
+                "s2s_graph_mode": "one-shot",
                 "python_request_path": False,
                 "ready": True,
                 "required_graphs": sorted(S2S_REQUIRED_GRAPH_FILES),

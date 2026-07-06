@@ -159,6 +159,22 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         | Some value -> value.Graphs.Keys |> Seq.toArray |> Array.sort
         | None -> Array.empty
 
+    let bundleGraphMode =
+        match manifest with
+        | Some value -> value.Capabilities.GraphMode |> Option.defaultValue "one-shot"
+        | None -> "unknown"
+
+    let bundleThinkerFeatureMode =
+        match manifest with
+        | Some value -> value.Capabilities.ThinkerFeatureMode |> Option.defaultValue "unknown"
+        | None -> "unknown"
+
+    let thinkerMaxAudioItems =
+        match manifest with
+        | Some value -> value.Capabilities.ThinkerMaxAudioItems |> Option.defaultValue 1
+        | None -> 1
+        |> max 1
+
     let missingGraphs =
         if useMergedSession && not (graphNames |> Array.exists ((=) mergedGraphName)) then
             [| mergedGraphName |]
@@ -633,7 +649,11 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
     let audioFrame (samplingOptions: S2sSamplingOptions) (logits: DenseTensor<float32>) (hiddenStates: DenseTensor<float32>) =
         let selectNextIds (logits: DenseTensor<float32>) =
             if samplingOptions.Enabled then
-                TensorMath.sampleLast Random.Shared samplingOptions.Temperature samplingOptions.TopP samplingOptions.TopK logits
+                match samplingOptions.Algorithm with
+                | TopKTopP ->
+                    TensorMath.sampleLast Random.Shared samplingOptions.Temperature samplingOptions.TopP samplingOptions.TopK logits
+                | ChromaTopK ->
+                    TensorMath.sampleChromaTopKLast Random.Shared samplingOptions.Temperature samplingOptions.TopK logits
             else
                 TensorMath.argmaxLast logits
 
@@ -976,11 +996,20 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
           MissingGraphs = missingGraphs
           AvailableGraphs = graphNames
           ExecutionProvider = executionProvider
+          BundleGraphMode = bundleGraphMode
+          BundleThinkerFeatureMode = bundleThinkerFeatureMode
+          ThinkerMaxAudioItems = thinkerMaxAudioItems
           Message = message }
 
     member _.MemoryMode = normalizedMemoryMode
 
     member _.OrtMemoryProfile = normalizedOrtMemoryProfile
+
+    member _.BundleGraphMode = bundleGraphMode
+
+    member _.BundleThinkerFeatureMode = bundleThinkerFeatureMode
+
+    member _.ThinkerMaxAudioItems = thinkerMaxAudioItems
 
     member _.OptimizedModelCacheDir =
         optimizedModelCacheDir |> Option.toObj
@@ -1190,6 +1219,7 @@ type ChromaS2sOnnxRunner(modelDir: string, bundleDir: string, executionProvider:
         let decodedSilenceGuardEnabled = codecStallGuardFrames > 0
         let timings = Dictionary<string, float>(StringComparer.Ordinal)
         timings["samplingEnabled"] <- if samplingOptions.Enabled then 1.0 else 0.0
+        timings["samplingAlgorithm"] <- if samplingOptions.Algorithm = ChromaTopK then 1.0 else 0.0
         timings["samplingTemperature"] <- samplingOptions.Temperature
         timings["samplingTopP"] <- samplingOptions.TopP
         timings["samplingTopK"] <- float samplingOptions.TopK

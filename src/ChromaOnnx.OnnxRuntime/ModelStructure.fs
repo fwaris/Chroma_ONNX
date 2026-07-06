@@ -147,6 +147,9 @@ type ChromaS2sBundleStatus =
       MissingGraphs: string array
       AvailableGraphs: string array
       ExecutionProvider: string
+      BundleGraphMode: string
+      BundleThinkerFeatureMode: string
+      ThinkerMaxAudioItems: int
       Message: string }
 
 type S2sGraphState =
@@ -187,13 +190,23 @@ type S2sGenerationResult =
             for buffer in this.OwnedBuffers do
                 buffer.Dispose()
 
+type S2sSamplingAlgorithm =
+    | TopKTopP
+    | ChromaTopK
+    member this.Name =
+        match this with
+        | TopKTopP -> "top-k-top-p"
+        | ChromaTopK -> "chroma"
+
 type S2sSamplingOptions =
     { Enabled: bool
+      Algorithm: S2sSamplingAlgorithm
       Temperature: float
       TopP: float
       TopK: int }
     static member Greedy =
         { Enabled = false
+          Algorithm = TopKTopP
           Temperature = 1.0
           TopP = 1.0
           TopK = 0 }

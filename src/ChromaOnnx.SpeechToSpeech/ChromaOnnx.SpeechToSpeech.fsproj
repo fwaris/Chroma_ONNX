@@ -8,6 +8,8 @@
   <ItemGroup>
     <Compile Include="RuntimeTypes.fs" />
     <Compile Include="S2sRuntime.fs" />
+    <Compile Include="AgentRuntimeTypes.fs" />
+    <Compile Include="GemmaChromaAgentRuntime.fs" />
   </ItemGroup>
 
   <ItemGroup>

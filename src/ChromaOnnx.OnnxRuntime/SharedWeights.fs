@@ -42,10 +42,16 @@ type SharedGraphInfo =
       Inputs: string array
       Outputs: string array }
 
+type SharedBundleCapabilities =
+    { GraphMode: string option
+      ThinkerFeatureMode: string option
+      ThinkerMaxAudioItems: int option }
+
 type SharedBundleManifest =
     { BundleDir: string
       HiddenSize: int option
       AudioNumCodebooks: int option
+      Capabilities: SharedBundleCapabilities
       Graphs: Dictionary<string, SharedGraphInfo>
       Initializers: SharedInitializerEntry array }
 
@@ -380,6 +386,18 @@ module SharedWeights =
         use doc = JsonDocument.Parse(File.ReadAllText(manifestPath))
         let root = doc.RootElement
         let graphs = Dictionary<string, SharedGraphInfo>(StringComparer.Ordinal)
+        let capabilitiesElement =
+            match root.TryGetProperty("capabilities") with
+            | true, value when value.ValueKind = JsonValueKind.Object -> Some value
+            | _ -> None
+        let thinkerMaxAudioItems =
+            capabilitiesElement |> Option.bind (tryGetInt "thinker_max_audio_items")
+        let graphMode =
+            capabilitiesElement |> Option.bind (optionalString "s2s_graph_mode")
+        let capabilities =
+            { GraphMode = graphMode
+              ThinkerFeatureMode = capabilitiesElement |> Option.bind (optionalString "thinker_feature_mode")
+              ThinkerMaxAudioItems = thinkerMaxAudioItems }
 
         for property in root.GetProperty("graphs").EnumerateObject() do
             let path = requiredString "path" property.Value |> resolvePath bundleDir
@@ -407,5 +425,6 @@ module SharedWeights =
         { BundleDir = bundleDir
           HiddenSize = tryGetInt "hidden_size" root
           AudioNumCodebooks = tryGetInt "audio_num_codebooks" root
+          Capabilities = capabilities
           Graphs = graphs
           Initializers = initializers }

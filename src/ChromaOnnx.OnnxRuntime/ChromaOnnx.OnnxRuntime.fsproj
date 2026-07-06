@@ -5,11 +5,22 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <OrtGenAiRoot Condition="'$(OrtGenAiRoot)' == ''">E:\s\repos\onnxruntime-genai</OrtGenAiRoot>
+    <OrtGenAiBuildDir Condition="'$(OrtGenAiBuildDir)' == ''">$(OrtGenAiRoot)\build\WindowsNinjaCudaNoPython5\Release</OrtGenAiBuildDir>
+    <OrtGenAiManagedDir Condition="'$(OrtGenAiManagedDir)' == ''">$(OrtGenAiRoot)\src\csharp\bin\Release\net8.0</OrtGenAiManagedDir>
+    <OrtGenAiOrtNativeDir Condition="'$(OrtGenAiOrtNativeDir)' == ''">$(OrtGenAiBuildDir)\Release</OrtGenAiOrtNativeDir>
+  </PropertyGroup>
+
   <ItemGroup>
     <Compile Include="ModelStructure.fs" />
     <Compile Include="SharedWeights.fs" />
     <Compile Include="TensorUtils.fs" />
     <Compile Include="Media.fs" />
+    <Compile Include="GemmaTypes.fs" />
+    <Compile Include="GemmaProcessor.fs" />
+    <Compile Include="GemmaOrtGenAiRunner.fs" />
+    <Compile Include="GemmaOnnxRunner.fs" />
     <Compile Include="ChromaNativeProcessor.fs" />
     <Compile Include="LegacyOnnxRunners.fs" />
     <Compile Include="S2sOnnxRunner.fs" />
@@ -22,8 +33,22 @@
   <ItemGroup>
     <PackageReference Include="libtorch-cpu" />
     <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntimeGenAI.Cuda" Condition="!Exists('$(OrtGenAiManagedDir)\Microsoft.ML.OnnxRuntimeGenAI.dll')" />
     <PackageReference Include="Tokenizers.HuggingFace" />
     <PackageReference Include="TorchSharp" />
     <PackageReference Include="TorchSharp.Fun" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('$(OrtGenAiManagedDir)\Microsoft.ML.OnnxRuntimeGenAI.dll')">
+    <Reference Include="Microsoft.ML.OnnxRuntimeGenAI">
+      <HintPath>$(OrtGenAiManagedDir)\Microsoft.ML.OnnxRuntimeGenAI.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <None Include="$(OrtGenAiBuildDir)\onnxruntime-genai.dll" Condition="Exists('$(OrtGenAiBuildDir)\onnxruntime-genai.dll')" CopyToOutputDirectory="PreserveNewest" Link="onnxruntime-genai.dll" />
+    <None Include="$(OrtGenAiBuildDir)\onnxruntime-genai-cuda.dll" Condition="Exists('$(OrtGenAiBuildDir)\onnxruntime-genai-cuda.dll')" CopyToOutputDirectory="PreserveNewest" Link="onnxruntime-genai-cuda.dll" />
+    <None Include="$(OrtGenAiOrtNativeDir)\onnxruntime.dll" Condition="Exists('$(OrtGenAiOrtNativeDir)\onnxruntime.dll')" CopyToOutputDirectory="PreserveNewest" Link="onnxruntime.dll" />
+    <None Include="$(OrtGenAiOrtNativeDir)\onnxruntime_providers_cuda.dll" Condition="Exists('$(OrtGenAiOrtNativeDir)\onnxruntime_providers_cuda.dll')" CopyToOutputDirectory="PreserveNewest" Link="onnxruntime_providers_cuda.dll" />
+    <None Include="$(OrtGenAiOrtNativeDir)\onnxruntime_providers_shared.dll" Condition="Exists('$(OrtGenAiOrtNativeDir)\onnxruntime_providers_shared.dll')" CopyToOutputDirectory="PreserveNewest" Link="onnxruntime_providers_shared.dll" />
+    <None Include="$(OrtGenAiOrtNativeDir)\onnxruntime_providers_tensorrt.dll" Condition="Exists('$(OrtGenAiOrtNativeDir)\onnxruntime_providers_tensorrt.dll')" CopyToOutputDirectory="PreserveNewest" Link="onnxruntime_providers_tensorrt.dll" />
   </ItemGroup>
 </Project>

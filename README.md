@@ -264,7 +264,7 @@ If the safetensors were downloaded manually, place the full Hugging Face model s
 
 6. Use the committed deploy bundle, or regenerate it after changing export code.
 
-The repository carries the portable, weights-free S2S artifacts in `onnx_deploy/chroma-s2s-full-v2`:
+The repository carries the portable, weights-free one-shot/current-turn S2S artifacts in `onnx_deploy/chroma-s2s-full-v2`:
 
 ```text
 onnx_deploy/chroma-s2s-full-v2/
@@ -281,10 +281,13 @@ The bundle expects the original safetensor shards under `models/chroma-4b`. If y
   --bundle safetensor-shared-s2s `
   --device cuda `
   --dtype float32 `
-  --thinker-active-frames 1 `
+  --thinker-active-frames 100 `
+  --thinker-audio-items 1 `
   --single-onnx-s2s `
   --validate
 ```
+
+Chroma S2S sessions are current-turn-only. For context-aware agent flows, keep text/audio history in the companion agent layer and create a fresh Chroma generation for vocalization.
 
 7. Build the local-external optimized ONNX cache used by ORT 1.27:
 
@@ -353,7 +356,8 @@ After downloading or refreshing the Hugging Face `FlashLabs/Chroma-4B` repo unde
   --bundle safetensor-shared-s2s `
   --device cuda `
   --dtype float32 `
-  --thinker-active-frames 1 `
+  --thinker-active-frames 100 `
+  --thinker-audio-items 1 `
   --single-onnx-s2s `
   --validate
 ```
@@ -409,7 +413,7 @@ dotnet run --project src\ChromaOnnx -- s2s-offline `
 
 ### Single Merged S2S Bundle
 
-This is the current recommended bundle for the F#/ONNX S2S service:
+The Chroma S2S export is single-turn/current-turn. Keep `--thinker-audio-items 1` so the traced prefill graph matches the runtime:
 
 ```powershell
 .venv\Scripts\python.exe scripts\export_chroma_onnx.py `
@@ -418,7 +422,8 @@ This is the current recommended bundle for the F#/ONNX S2S service:
   --bundle safetensor-shared-s2s `
   --device cuda `
   --dtype float32 `
-  --thinker-active-frames 1 `
+  --thinker-active-frames 100 `
+  --thinker-audio-items 1 `
   --single-onnx-s2s `
   --validate
 ```
@@ -432,6 +437,8 @@ onnx_deploy/chroma-s2s-full-v2/
 ```
 
 For repeated production-style runs, also build the local-external optimized ONNX cache shown in the previous section and configure the service or CLI to use it. It avoids ORT external-data path validation failures by placing hardlinks to the safetensor shards beside the cached ONNX metadata file.
+
+The Chroma runtime does not replay prior user or assistant audio into model context. If a custom bundle advertises more than one thinker audio item, the extra capacity is ignored by the current service path.
 
 For a simplified visual overview of the merged dispatcher, split logical graphs, and original-vs-optimized ONNX shape, see [diagrams/onnx_s2s_simplified.md](diagrams/onnx_s2s_simplified.md).
 
@@ -513,7 +520,21 @@ The browser lab defaults its reference text and reference audio to `assets/south
 
 On 16 GB CUDA cards, the standalone service defaults `CudaGpuMemLimitMb` to `15360` and `StreamMinFreeVramMb` to `2048` to leave VRAM headroom while still giving ORT enough arena space for large prefill allocations. Override those values with `ChromaOnnx__S2s__CudaGpuMemLimitMb` and `ChromaOnnx__S2s__StreamMinFreeVramMb` if your card has more or less VRAM.
 
-The standalone service defaults to the Chroma system prompt and non-deterministic sampling close to the official Chroma example: `GenerationMode=sample`, `SamplingTemperature=0.7`, `SamplingTopP=0.9`, and `SamplingTopK=50`. Set `ChromaOnnx__S2s__GenerationMode=greedy` when you want deterministic argmax output for debugging.
+The standalone service defaults to the Chroma system prompt and the top-k/top-p non-deterministic sampler: `GenerationMode=sample`, `SamplingAlgorithm=top-k-top-p`, `SamplingTemperature=0.7`, `SamplingTopP=0.9`, and `SamplingTopK=50`. Set `ChromaOnnx__S2s__SamplingAlgorithm=chroma` for Chroma PyTorch compatibility; that mode uses Chroma's top-k-only exponential-race sampler and ignores `SamplingTopP`. Set `ChromaOnnx__S2s__GenerationMode=greedy` when you want deterministic argmax output for debugging.
+
+Gemma agent mode targets the Mobius `Q4_K_M/cuda` export at `models/gemma-4-e2b-it-onnx-mobius/Q4_K_M/cuda` locally, or under `Chroma_ONNX_assets\models\gemma-4-e2b-it-onnx-mobius\Q4_K_M\cuda` on the A100 runtime. Download and stage that CUDA INT4 bundle with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\download_gemma4_onnx.ps1 `
+  -ModelDir models\gemma-4-e2b-it-onnx-mobius `
+  -Variant Q4_K_M/cuda
+
+powershell -ExecutionPolicy Bypass -File scripts\sync_gemma4_onnx_assets.ps1 `
+  -AssetsRoot E:\s\temp\Chroma_ONNX_assets `
+  -Variant Q4_K_M/cuda
+```
+
+Gemma defaults to CUDA execution through raw ONNX Runtime sessions. ORT GenAI 0.14.1 cannot parse this package's `per_layer_inputs` config yet, so the service drives the Mobius `embedding`, `audio_encoder`, and `decoder` graphs directly.
 
 API shape:
 

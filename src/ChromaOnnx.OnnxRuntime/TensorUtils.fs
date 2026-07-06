@@ -191,88 +191,166 @@ module TensorMath =
         if batch < 1 || sequence < 1 || vocab < 1 then
             invalidArg (nameof logits) "Expected logits shape [batch, sequence, vocab] with positive dimensions."
 
-        let temperature =
-            if Double.IsNaN temperature || Double.IsInfinity temperature || temperature <= 0.0 then
-                1.0
-            else
-                temperature
-        let topP =
-            if Double.IsNaN topP || Double.IsInfinity topP || topP <= 0.0 || topP > 1.0 then
-                1.0
-            else
-                topP
-        let topK =
-            if topK <= 0 || topK > vocab then
-                vocab
-            else
-                topK
+        if not (Double.IsNaN temperature) && not (Double.IsInfinity temperature) && temperature = 0.0 then
+            argmaxLast logits
+        else
+            let temperature =
+                if Double.IsNaN temperature || Double.IsInfinity temperature || temperature < 0.0 then
+                    1.0
+                else
+                    temperature
+            let topP =
+                if Double.IsNaN topP || Double.IsInfinity topP || topP <= 0.0 || topP > 1.0 then
+                    1.0
+                else
+                    topP
+            let topK =
+                if topK <= 0 || topK > vocab then
+                    vocab
+                else
+                    topK
 
-        let values = logits.Buffer.Span
-        let strides = logits.Strides
-        let ids = Array.zeroCreate<int64> batch
+            let values = logits.Buffer.Span
+            let strides = logits.Strides
+            let ids = Array.zeroCreate<int64> batch
 
-        for batchIndex in 0 .. batch - 1 do
-            let rowStart = (batchIndex * strides[0]) + ((sequence - 1) * strides[1])
-            let candidates = Array.zeroCreate<int * float> vocab
-            for vocabIndex in 0 .. vocab - 1 do
-                let value = float values[rowStart + (vocabIndex * strides[2])]
-                let value =
-                    if Double.IsNaN value then
-                        Double.NegativeInfinity
-                    else
-                        value
-                candidates[vocabIndex] <- vocabIndex, value
+            for batchIndex in 0 .. batch - 1 do
+                let rowStart = (batchIndex * strides[0]) + ((sequence - 1) * strides[1])
+                let candidates = Array.zeroCreate<int * float> vocab
+                for vocabIndex in 0 .. vocab - 1 do
+                    let value = float values[rowStart + (vocabIndex * strides[2])]
+                    let value =
+                        if Double.IsNaN value then
+                            Double.NegativeInfinity
+                        else
+                            value
+                    candidates[vocabIndex] <- vocabIndex, value
 
-            Array.sortInPlaceWith (fun (_, left) (_, right) -> compare right left) candidates
+                Array.sortInPlaceWith (fun (_, left) (_, right) -> compare right left) candidates
 
-            let _, maxLogit = candidates[0]
-            let weights = Array.zeroCreate<float> topK
-            let mutable denominator = 0.0
-            for index in 0 .. topK - 1 do
-                let _, candidateLogit = candidates[index]
-                let shifted = (candidateLogit - maxLogit) / temperature
-                let weight =
-                    if Double.IsNaN shifted then
-                        0.0
-                    else
-                        Math.Exp(shifted)
-                weights[index] <- weight
-                denominator <- denominator + weight
+                let _, maxLogit = candidates[0]
+                let weights = Array.zeroCreate<float> topK
+                let mutable denominator = 0.0
+                for index in 0 .. topK - 1 do
+                    let _, candidateLogit = candidates[index]
+                    let shifted = (candidateLogit - maxLogit) / temperature
+                    let weight =
+                        if Double.IsNaN shifted then
+                            0.0
+                        else
+                            Math.Exp(shifted)
+                    weights[index] <- weight
+                    denominator <- denominator + weight
 
-            let mutable keepCount = topK
-            if topP < 1.0 && denominator > 0.0 then
-                let mutable cumulative = 0.0
-                let mutable index = 0
-                let mutable foundCutoff = false
-                while not foundCutoff && index < topK do
-                    cumulative <- cumulative + (weights[index] / denominator)
-                    if cumulative >= topP then
-                        keepCount <- index + 1
-                        foundCutoff <- true
-                    index <- index + 1
+                let mutable keepCount = topK
+                if topP < 1.0 && denominator > 0.0 then
+                    let mutable cumulative = 0.0
+                    let mutable index = 0
+                    let mutable foundCutoff = false
+                    while not foundCutoff && index < topK do
+                        cumulative <- cumulative + (weights[index] / denominator)
+                        if cumulative >= topP then
+                            keepCount <- index + 1
+                            foundCutoff <- true
+                        index <- index + 1
 
-            let mutable sampleTotal = 0.0
-            for index in 0 .. keepCount - 1 do
-                sampleTotal <- sampleTotal + weights[index]
+                let mutable sampleTotal = 0.0
+                for index in 0 .. keepCount - 1 do
+                    sampleTotal <- sampleTotal + weights[index]
 
-            let firstId, _ = candidates[0]
-            let mutable chosen = firstId
-            if sampleTotal > 0.0 then
-                let target = rng.NextDouble() * sampleTotal
-                let mutable cumulative = 0.0
-                let mutable index = 0
-                let mutable selected = false
-                while not selected && index < keepCount do
-                    cumulative <- cumulative + weights[index]
-                    if target <= cumulative then
-                        let candidateId, _ = candidates[index]
+                let firstId, _ = candidates[0]
+                let mutable chosen = firstId
+                if sampleTotal > 0.0 then
+                    let target = rng.NextDouble() * sampleTotal
+                    let mutable cumulative = 0.0
+                    let mutable index = 0
+                    let mutable selected = false
+                    while not selected && index < keepCount do
+                        cumulative <- cumulative + weights[index]
+                        if target <= cumulative then
+                            let candidateId, _ = candidates[index]
+                            chosen <- candidateId
+                            selected <- true
+                        index <- index + 1
+
+                ids[batchIndex] <- int64 chosen
+
+            ids
+
+    let sampleChromaTopKLast (rng: Random) (temperature: float) (topK: int) (logits: DenseTensor<float32>) =
+        let dims = logits.Dimensions
+        if dims.Length <> 3 then
+            invalidArg (nameof logits) "Expected logits shape [batch, sequence, vocab]."
+
+        let batch = dims[0]
+        let sequence = dims[1]
+        let vocab = dims[2]
+        if batch < 1 || sequence < 1 || vocab < 1 then
+            invalidArg (nameof logits) "Expected logits shape [batch, sequence, vocab] with positive dimensions."
+
+        if not (Double.IsNaN temperature) && not (Double.IsInfinity temperature) && temperature = 0.0 then
+            argmaxLast logits
+        else
+            let temperature =
+                if Double.IsNaN temperature || Double.IsInfinity temperature || temperature < 0.0 then
+                    1.0
+                else
+                    temperature
+            let topK =
+                if topK <= 0 || topK > vocab then
+                    vocab
+                else
+                    topK
+
+            let values = logits.Buffer.Span
+            let strides = logits.Strides
+            let ids = Array.zeroCreate<int64> batch
+
+            for batchIndex in 0 .. batch - 1 do
+                let rowStart = (batchIndex * strides[0]) + ((sequence - 1) * strides[1])
+                let candidates = Array.zeroCreate<int * float> vocab
+                for vocabIndex in 0 .. vocab - 1 do
+                    let value = float values[rowStart + (vocabIndex * strides[2])]
+                    let value =
+                        if Double.IsNaN value then
+                            Double.NegativeInfinity
+                        else
+                            value / temperature
+                    candidates[vocabIndex] <- vocabIndex, value
+
+                Array.sortInPlaceWith (fun (_, left) (_, right) -> compare right left) candidates
+
+                let _, maxLogit = candidates[0]
+                let _, cutoffLogit = candidates[topK - 1]
+                let mutable keepCount = topK
+                while keepCount < vocab && (snd candidates[keepCount]) >= cutoffLogit do
+                    keepCount <- keepCount + 1
+
+                let firstId, _ = candidates[0]
+                let mutable chosen = firstId
+                let mutable bestRace = Double.NegativeInfinity
+
+                for index in 0 .. keepCount - 1 do
+                    let candidateId, candidateLogit = candidates[index]
+                    let shifted = candidateLogit - maxLogit
+                    let weight =
+                        if Double.IsNaN shifted then
+                            0.0
+                        else
+                            Math.Exp(shifted)
+
+                    let randomValue = min (1.0 - Double.Epsilon) (max 0.0 (rng.NextDouble()))
+                    let uniform = max Double.Epsilon (1.0 - randomValue)
+                    let exponential = max Double.Epsilon (-Math.Log(uniform))
+                    let race = weight / exponential
+
+                    if race > bestRace then
+                        bestRace <- race
                         chosen <- candidateId
-                        selected <- true
-                    index <- index + 1
 
-            ids[batchIndex] <- int64 chosen
+                ids[batchIndex] <- int64 chosen
 
-        ids
+            ids
 
     let lastHidden (hiddenStates: DenseTensor<float32>) =
         let dims = hiddenStates.Dimensions
