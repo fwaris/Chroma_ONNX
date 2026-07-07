@@ -29,7 +29,7 @@ module VoiceAgentWebApp =
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Gemma + PersonaPlex</title>
+  <title>Gemma + TTS</title>
   <style>
     body { margin: 0; font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: #17212b; background: #fff; }
     header { padding: 14px 22px; border-bottom: 1px solid #d7dee6; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
@@ -48,10 +48,10 @@ module VoiceAgentWebApp =
   </style>
 </head>
 <body>
-  <header><strong>Gemma + PersonaPlex</strong><span id="runtime">Checking runtime...</span></header>
+  <header><strong>Gemma + TTS</strong><span id="runtime">Checking runtime...</span></header>
   <main>
     <form id="form">
-      <label>Mode<select id="mode"><option value="gemma-personaplex">Gemma + PersonaPlex</option><option value="personaplex-full">PersonaPlex full ONNX</option></select></label>
+      <label>Mode<select id="mode"><option value="gemma-tts">Gemma + TTS</option></select></label>
       <label>System prompt<textarea id="systemPrompt">You are a concise voice assistant. Use tools when useful, then answer naturally.</textarea></label>
       <label>Turn audio<input id="turnAudio" type="file" accept="audio/*,.f32" required></label>
       <button id="send" type="submit">Send</button>
@@ -115,8 +115,8 @@ module VoiceAgentWebApp =
         const payload = JSON.parse(event.data);
         details.textContent = JSON.stringify(payload, null, 2);
         if (payload.type === 'agent.final_text') message.textContent = payload.text;
-        if (payload.type === 'personaplex.generation.done') message.textContent = payload.message;
-        if (payload.type === 'personaplex.unavailable') message.textContent = payload.message;
+        if (payload.type === 'agent.filler_text') message.textContent = payload.text;
+        if (payload.type === 'tts.unavailable') message.textContent = payload.message;
       };
       await new Promise((resolve, reject) => {
         socket.onopen = resolve;
@@ -199,6 +199,23 @@ module VoiceAgentWebApp =
                missingFiles = status.Gemma.MissingFiles
                loadedSessions = status.Gemma.LoadedSessions
                message = status.Gemma.Message |}
+           stt =
+            {| ready = status.Stt.Ready
+               runtime = status.Stt.Runtime
+               inputSampleRate = status.Stt.InputSampleRate
+               outputLanguage = status.Stt.OutputLanguage
+               message = status.Stt.Message |}
+           tts =
+            {| ready = status.Tts.Ready
+               supportsVoiceCloning = status.Tts.SupportsVoiceCloning
+               supportsStreaming = status.Tts.SupportsStreaming
+               runtime = status.Tts.Runtime
+               modelDir = status.Tts.ModelDir
+               executionProvider = status.Tts.ExecutionProvider
+               outputSampleRate = status.Tts.OutputSampleRate
+               voiceSamplePath = status.Tts.VoiceSamplePath
+               missingFiles = status.Tts.MissingFiles
+               message = status.Tts.Message |}
            personaPlex =
             {| ready = status.PersonaPlex.Ready
                codecReady = status.PersonaPlex.CodecReady
@@ -306,6 +323,12 @@ module VoiceAgentWebApp =
                                maxTurnAudioSamples24k = agent.MaxTurnAudioSamples24k
                                gemmaReady = status.Gemma.Ready
                                gemmaMessage = status.Gemma.Message
+                               sttReady = status.Stt.Ready
+                               sttMessage = status.Stt.Message
+                               ttsReady = status.Tts.Ready
+                               ttsRuntime = status.Tts.Runtime
+                               ttsVoiceCloning = status.Tts.SupportsVoiceCloning
+                               ttsMessage = status.Tts.Message
                                personaPlexCodecReady = status.PersonaPlex.CodecReady
                                personaPlexSpeechToSpeechReady = status.PersonaPlex.SpeechToSpeechReady
                                personaPlexRuntime = status.PersonaPlex.Runtime
@@ -313,6 +336,13 @@ module VoiceAgentWebApp =
                                maxHistoryTurns = status.MaxHistoryTurns |}
 
                     use turnAudio = new MemoryStream()
+                    let mutable activeTurnCancellation: CancellationTokenSource option = None
+                    let mutable activeTurnTask: Task option = None
+                    let cancelActiveTurn () =
+                        match activeTurnCancellation with
+                        | Some cts ->
+                            try cts.Cancel() with _ -> ()
+                        | None -> ()
                     let mutable running = true
                     while running && socket.State = WebSocketState.Open do
                         let! messageType, payload = receiveMessage socket
@@ -340,11 +370,11 @@ module VoiceAgentWebApp =
                                     | _ -> null
                                 match eventType with
                                 | "turn.start" ->
+                                    cancelActiveTurn ()
                                     turnAudio.SetLength 0L
                                     do! sendJsonLocked {| ``type`` = "turn.accepted"; id = session.Id |}
                                 | "turn.cancel" ->
-                                    socketCancellation.Cancel()
-                                    running <- false
+                                    cancelActiveTurn ()
                                     do! trySendJsonLocked {| ``type`` = "generation.canceled"; id = session.Id |}
                                 | "turn.end" ->
                                     let turnAudioBytes = turnAudio.ToArray()
@@ -361,8 +391,27 @@ module VoiceAgentWebApp =
                                                     do! sendJsonLocked {| ``type`` = "agent.tool_call"; id = id; requestId = requestId; turnIndex = turnIndex; round = call.Round; name = call.Name; arguments = call.Arguments; rawText = call.RawText |}
                                                 | VoiceAgentToolResult(id, requestId, turnIndex, result) ->
                                                     do! sendJsonLocked {| ``type`` = "agent.tool_result"; id = id; requestId = requestId; turnIndex = turnIndex; round = result.Round; name = result.Name; success = result.Success; result = result.Result; error = nullableString result.Error |}
+                                                | VoiceAgentFillerText(id, requestId, turnIndex, fillerText) ->
+                                                    do! sendJsonLocked {| ``type`` = "agent.filler_text"; id = id; requestId = requestId; turnIndex = turnIndex; text = fillerText |}
                                                 | VoiceAgentFinalText(id, requestId, turnIndex, finalText) ->
                                                     do! sendJsonLocked {| ``type`` = "agent.final_text"; id = id; requestId = requestId; turnIndex = turnIndex; text = finalText |}
+                                                | TtsSynthesisStarted(id, requestId, turnIndex, phase, text) ->
+                                                    do! sendJsonLocked {| ``type`` = $"tts.{phase}.started"; id = id; requestId = requestId; turnIndex = turnIndex; phase = phase; text = text |}
+                                                | TtsAudioChunk(id, requestId, turnIndex, phase, sampleRate, samples) ->
+                                                    let bytes = AudioChunk.float32ToLittleEndianBytes samples
+                                                    do! sendJsonLocked {| ``type`` = $"tts.{phase}.chunk"; id = id; requestId = requestId; turnIndex = turnIndex; phase = phase; sampleRate = sampleRate; bytes = bytes.Length; samples = samples.Length |}
+                                                    do! sendLock.WaitAsync()
+                                                    try
+                                                        if socket.State = WebSocketState.Open then
+                                                            do! socket.SendAsync(ArraySegment<byte>(bytes), WebSocketMessageType.Binary, true, CancellationToken.None)
+                                                    finally
+                                                        sendLock.Release() |> ignore
+                                                | TtsSynthesisDone(id, requestId, turnIndex, result) ->
+                                                    do! sendJsonLocked {| ``type`` = $"tts.{result.Phase}.done"; id = id; requestId = requestId; turnIndex = turnIndex; phase = result.Phase; text = result.Text; outputPath = nullableString result.OutputPath; sampleRate = result.SampleRate; samples = result.Samples; durationMs = result.DurationMs; inferenceTimeMs = result.InferenceTimeMs; message = result.Message |}
+                                                | TtsSynthesisCanceled(id, requestId, turnIndex, phase) ->
+                                                    do! sendJsonLocked {| ``type`` = $"tts.{phase}.canceled"; id = id; requestId = requestId; turnIndex = turnIndex; phase = phase |}
+                                                | TtsUnavailable(id, requestId, turnIndex, phase, message) ->
+                                                    do! sendJsonLocked {| ``type`` = "tts.unavailable"; id = id; requestId = requestId; turnIndex = turnIndex; phase = phase; message = message |}
                                                 | PersonaPlexCodecStarted(id, requestId, turnIndex) ->
                                                     do! sendJsonLocked {| ``type`` = "personaplex.codec.started"; id = id; requestId = requestId; turnIndex = turnIndex |}
                                                 | PersonaPlexCodecDone(id, requestId, turnIndex, result) ->
@@ -387,22 +436,37 @@ module VoiceAgentWebApp =
                                                     do! sendJsonLocked {| ``type`` = "generation.canceled"; id = id; requestId = nullableString requestId |}
                                             }
                                             :> Task
-                                        try
-                                            let! _ =
-                                                agent.RunTurnAsync(
-                                                    { SessionId = session.Id
-                                                      UserAudio24k = userAudio
-                                                      RequestId = None },
-                                                    emit,
-                                                    socketCancellation.Token
-                                                )
-                                            turnAudio.SetLength 0L
-                                        with
-                                        | :? OperationCanceledException ->
-                                            running <- false
-                                            do! trySendJsonLocked {| ``type`` = "generation.canceled"; id = session.Id |}
-                                        | ex ->
-                                            do! trySendJsonLocked {| ``type`` = "error"; message = ex.Message; agent = statusPayload agent |}
+                                        cancelActiveTurn ()
+                                        let turnCancellation = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted)
+                                        activeTurnCancellation <- Some turnCancellation
+                                        turnAudio.SetLength 0L
+                                        let runTurn =
+                                            task {
+                                                try
+                                                    try
+                                                        let! _ =
+                                                            agent.RunTurnAsync(
+                                                                { SessionId = session.Id
+                                                                  UserAudio24k = userAudio
+                                                                  RequestId = None },
+                                                                emit,
+                                                                turnCancellation.Token
+                                                            )
+                                                        ()
+                                                    with
+                                                    | :? OperationCanceledException ->
+                                                        do! trySendJsonLocked {| ``type`` = "generation.canceled"; id = session.Id |}
+                                                    | ex ->
+                                                        do! trySendJsonLocked {| ``type`` = "error"; message = ex.Message; agent = statusPayload agent |}
+                                                finally
+                                                    match activeTurnCancellation with
+                                                    | Some current when obj.ReferenceEquals(current, turnCancellation) ->
+                                                        activeTurnCancellation <- None
+                                                        activeTurnTask <- None
+                                                    | _ -> ()
+                                                    turnCancellation.Dispose()
+                                            }
+                                        activeTurnTask <- Some(runTurn :> Task)
                                 | _ ->
                                     do! sendJsonLocked {| ``type`` = "error"; message = $"Unknown WebSocket event '{eventType}'." |}
                             with ex ->
@@ -411,6 +475,7 @@ module VoiceAgentWebApp =
                             do! sendJsonLocked {| ``type`` = "error"; message = $"Unsupported WebSocket message type {messageType}." |}
 
                     if socket.State = WebSocketState.Open || socket.State = WebSocketState.CloseReceived then
+                        cancelActiveTurn ()
                         do! socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "done", CancellationToken.None)
         }
 

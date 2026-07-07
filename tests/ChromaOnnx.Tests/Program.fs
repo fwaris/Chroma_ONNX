@@ -439,7 +439,9 @@ module Program =
                             let hasToolResult =
                                 request.Messages
                                 |> Array.exists (fun message -> message.Role = GemmaChatRole.Tool)
-                            if hasToolResult then
+                            if request.Tools.Length = 0 then
+                                "Let me check that."
+                            elif hasToolResult then
                                 "It is time to test the agent."
                             else
                                 """<|tool_call>call:get_current_time{}<tool_call|>"""
@@ -557,11 +559,12 @@ module Program =
         let options = VoiceAgentOptions()
         options.WorkDir <- workDir
         options.MaxHistoryTurns <- 2
-        options.PersonaPlex.ExecutionProvider <- "cpu"
+        options.Tts.Runtime <- "fake-tone"
+        options.Tts.ExecutionProvider <- "cpu"
+        options.Tts.OutputSampleRate <- 24000
         let gemma = FakeGemmaRuntime() :> IGemmaRuntime
-        let personaPlex = FakePersonaPlexRuntime() :> IPersonaPlexRuntime
         let agent =
-            new GemmaPersonaPlexAgentRuntime(options, gemmaRuntime = gemma, personaPlexRuntime = personaPlex, workDir = workDir)
+            new GemmaVoiceAgentRuntime(options, gemmaRuntime = gemma, workDir = workDir)
             :> IVoiceAgentRuntime
         VoiceAgentWebApp.map app agent |> ignore
         try
@@ -907,7 +910,8 @@ module Program =
                 assertEqual "voice agent socket ready" "session.ready" ready
                 match readyPayload with
                 | Some payload ->
-                    assertEqual "voice agent personaplex sts gated" false (payload.GetProperty("personaPlexSpeechToSpeechReady").GetBoolean())
+                    assertEqual "voice agent tts ready" true (payload.GetProperty("ttsReady").GetBoolean())
+                    assertEqual "voice agent tts runtime" "fake-tone" (payload.GetProperty("ttsRuntime").GetString())
                 | None -> fail "voice agent socket ready" "ready payload missing"
 
                 let sendAgentTurn samples expectedTurnIndex =
@@ -941,10 +945,12 @@ module Program =
                             if not (turnEvents |> Array.contains "agent.transcription") then fail $"voice agent turn {expectedTurnIndex}" "transcription event missing"
                             if not (turnEvents |> Array.contains "agent.tool_call") then fail $"voice agent turn {expectedTurnIndex}" "tool call event missing"
                             if not (turnEvents |> Array.contains "agent.tool_result") then fail $"voice agent turn {expectedTurnIndex}" "tool result event missing"
+                            if not (turnEvents |> Array.contains "agent.filler_text") then fail $"voice agent turn {expectedTurnIndex}" "filler text event missing"
                             if not (turnEvents |> Array.contains "agent.final_text") then fail $"voice agent turn {expectedTurnIndex}" "final text event missing"
-                            if not (turnEvents |> Array.contains "personaplex.codec.started") then fail $"voice agent turn {expectedTurnIndex}" "PersonaPlex codec start missing"
-                            if not (turnEvents |> Array.contains "personaplex.codec.done") then fail $"voice agent turn {expectedTurnIndex}" "PersonaPlex codec done missing"
-                            if not (turnEvents |> Array.contains "personaplex.unavailable") then fail $"voice agent turn {expectedTurnIndex}" "PersonaPlex unavailable event missing"
+                            if not (turnEvents |> Array.contains "tts.filler.started") then fail $"voice agent turn {expectedTurnIndex}" "filler TTS start missing"
+                            if not (turnEvents |> Array.contains "tts.filler.done") then fail $"voice agent turn {expectedTurnIndex}" "filler TTS done missing"
+                            if not (turnEvents |> Array.contains "tts.final.started") then fail $"voice agent turn {expectedTurnIndex}" "final TTS start missing"
+                            if not (turnEvents |> Array.contains "tts.final.done") then fail $"voice agent turn {expectedTurnIndex}" "final TTS done missing"
                             return payload
                     }
 
@@ -959,8 +965,8 @@ module Program =
                         fail $"voice agent details turn {turnIndex}" $"unexpected details: {detailsBody}"
                     if not (detailsBody.Contains("get_current_time", StringComparison.Ordinal)) then
                         fail $"voice agent tool artifact turn {turnIndex}" $"tool call was not recorded: {detailsBody}"
-                    if not (detailsBody.Contains("personaPlexStatus", StringComparison.Ordinal)) then
-                        fail $"voice agent details turn {turnIndex}" $"PersonaPlex status missing: {detailsBody}"
+                    if not (detailsBody.Contains("ttsStatus", StringComparison.Ordinal)) then
+                        fail $"voice agent details turn {turnIndex}" $"TTS status missing: {detailsBody}"
                     let! audioResponse = client.GetAsync($"/api/agent/sessions/{sessionId}/turns/{turnIndex}/audio.wav")
                     assertEqual $"voice agent audio artifact turn {turnIndex}" HttpStatusCode.OK audioResponse.StatusCode
 
@@ -1510,10 +1516,17 @@ module Program =
         voiceValues["VoiceAgent:MaxTurnAudioSeconds"] <- "12"
         voiceValues["VoiceAgent:Gemma:ModelDir"] <- "models/gemma-voice"
         voiceValues["VoiceAgent:Gemma:Runtime"] <- "ort-genai"
-        voiceValues["VoiceAgent:PersonaPlex:ModelDir"] <- "models/personaplex"
-        voiceValues["VoiceAgent:PersonaPlex:Runtime"] <- "elbruno-codec"
-        voiceValues["VoiceAgent:PersonaPlex:ExecutionProvider"] <- "cpu"
-        voiceValues["VoiceAgent:PersonaPlex:VoicePreset"] <- "VARF2"
+        voiceValues["VoiceAgent:Tts:ModelDir"] <- "models/voxcpm2"
+        voiceValues["VoiceAgent:Tts:Runtime"] <- "voxcpm2-cli"
+        voiceValues["VoiceAgent:Tts:ExecutionProvider"] <- "cpu"
+        voiceValues["VoiceAgent:Tts:ExecutablePath"] <- "speech_voxcpm2_clone_onnx.exe"
+        voiceValues["VoiceAgent:Tts:VoiceSamplePath"] <- "voices/ref.wav"
+        voiceValues["VoiceAgent:Tts:VoiceSampleTranscript"] <- "reference words"
+        voiceValues["VoiceAgent:Tts:OutputSampleRate"] <- "48000"
+        voiceValues["VoiceAgent:Tts:RequireGpu"] <- "false"
+        voiceValues["VoiceAgent:Tts:RequireFullGpu"] <- "true"
+        voiceValues["VoiceAgent:Tts:CudaDeviceId"] <- "2"
+        voiceValues["VoiceAgent:Tts:GpuMemoryLimitGb"] <- "12.5"
         let voiceConfiguration =
             ConfigurationBuilder()
                 .AddInMemoryCollection(voiceValues)
@@ -1524,10 +1537,17 @@ module Program =
         assertEqual "voice agent turn seconds" 12.0 voiceOptions.MaxTurnAudioSeconds
         assertEqual "voice agent gemma model" "models/gemma-voice" voiceOptions.Gemma.ModelDir
         assertEqual "voice agent gemma runtime" "ort-genai" voiceOptions.Gemma.Runtime
-        assertEqual "voice agent personaplex model" "models/personaplex" voiceOptions.PersonaPlex.ModelDir
-        assertEqual "voice agent personaplex runtime" "elbruno-codec" voiceOptions.PersonaPlex.Runtime
-        assertEqual "voice agent personaplex provider" "cpu" voiceOptions.PersonaPlex.ExecutionProvider
-        assertEqual "voice agent personaplex voice" "VARF2" voiceOptions.PersonaPlex.VoicePreset
+        assertEqual "voice agent tts model" "models/voxcpm2" voiceOptions.Tts.ModelDir
+        assertEqual "voice agent tts runtime" "voxcpm2-cli" voiceOptions.Tts.Runtime
+        assertEqual "voice agent tts provider" "cpu" voiceOptions.Tts.ExecutionProvider
+        assertEqual "voice agent tts executable" "speech_voxcpm2_clone_onnx.exe" voiceOptions.Tts.ExecutablePath
+        assertEqual "voice agent tts voice sample" "voices/ref.wav" voiceOptions.Tts.VoiceSamplePath
+        assertEqual "voice agent tts voice transcript" "reference words" voiceOptions.Tts.VoiceSampleTranscript
+        assertEqual "voice agent tts sample rate" 48000 voiceOptions.Tts.OutputSampleRate
+        assertEqual "voice agent tts require gpu" false voiceOptions.Tts.RequireGpu
+        assertEqual "voice agent tts require full gpu" true voiceOptions.Tts.RequireFullGpu
+        assertEqual "voice agent tts cuda device" 2 voiceOptions.Tts.CudaDeviceId
+        assertEqual "voice agent tts gpu memory limit" 12.5 voiceOptions.Tts.GpuMemoryLimitGb
 
     let private runtimePathResolution () =
         let normalize path = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path))

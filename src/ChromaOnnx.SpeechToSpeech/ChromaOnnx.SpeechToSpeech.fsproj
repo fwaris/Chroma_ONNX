@@ -11,9 +11,11 @@
     <Compile Include="AgentRuntimeTypes.fs" />
     <Compile Include="GemmaChromaAgentRuntime.fs" />
     <Compile Include="VoiceAgentTypes.fs" />
+    <Compile Include="TtsRuntime.fs" />
     <Compile Include="ElBrunoPersonaPlexRuntime.fs" />
     <Compile Include="PersonaPlexFullOnnxRuntime.fs" />
     <Compile Include="GemmaPersonaPlexAgentRuntime.fs" />
+    <Compile Include="GemmaVoiceAgentRuntime.fs" />
   </ItemGroup>
 
   <ItemGroup>

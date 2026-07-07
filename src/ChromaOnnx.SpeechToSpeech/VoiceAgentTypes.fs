@@ -21,7 +21,85 @@ type VoiceAgentOptions() =
     member val MaxHistoryTurns = 8 with get, set
     member val MaxTurnAudioSeconds = 30.0 with get, set
     member val Gemma = GemmaRuntimeOptions() with get, set
+    member val Tts = TtsRuntimeOptions() with get, set
     member val PersonaPlex = PersonaPlexRuntimeOptions() with get, set
+
+and TtsRuntimeOptions() =
+    member val ModelDir = "models/voxcpm2-onnx" with get, set
+    member val Runtime = "voxcpm2-cli" with get, set
+    member val ExecutionProvider = "cuda" with get, set
+    member val ExecutablePath = "speech_voxcpm2_clone_onnx" with get, set
+    member val Variant = "onnx" with get, set
+    member val HuggingFaceRepoId = "soniqo/VoxCPM2-ONNX" with get, set
+    member val VoiceSamplePath = "" with get, set
+    member val VoiceSampleTranscript = "" with get, set
+    member val Instruction = "" with get, set
+    member val OutputSampleRate = 48000 with get, set
+    member val MaxSteps = 256 with get, set
+    member val Seed = 0 with get, set
+    member val StreamingChunkSeconds = 0.5 with get, set
+    member val RequireGpu = true with get, set
+    member val RequireFullGpu = false with get, set
+    member val CudaDeviceId = 0 with get, set
+    member val GpuMemoryLimitGb = 0.0 with get, set
+
+type SttRuntimeStatus =
+    { Ready: bool
+      Runtime: string
+      InputSampleRate: int
+      OutputLanguage: string
+      Message: string }
+
+type SttTranscriptionResult =
+    { Transcript: string
+      InputSampleRate: int
+      InputSamples: int
+      DurationMs: float
+      Message: string }
+
+type ISttRuntime =
+    abstract Status: unit -> SttRuntimeStatus
+    abstract TranscribeAsync:
+        samples24k: float32 array *
+        outputDirectory: string *
+        cancellationToken: CancellationToken -> Task<SttTranscriptionResult>
+
+type TtsRuntimeStatus =
+    { Ready: bool
+      SupportsVoiceCloning: bool
+      SupportsStreaming: bool
+      Runtime: string
+      ModelDir: string
+      ExecutionProvider: string
+      OutputSampleRate: int
+      VoiceSamplePath: string
+      MissingFiles: string array
+      Message: string }
+
+type TtsSynthesisRequest =
+    { Phase: string
+      Text: string
+      OutputDirectory: string
+      OutputFileName: string
+      VoiceSamplePath: string option
+      VoiceSampleTranscript: string option }
+
+type TtsSynthesisResult =
+    { Phase: string
+      Text: string
+      OutputPath: string option
+      SampleRate: int
+      Samples: int
+      DurationMs: float
+      InferenceTimeMs: float
+      Message: string }
+
+type ITtsRuntime =
+    abstract Status: unit -> TtsRuntimeStatus
+    abstract SynthesizeAsync:
+        request: TtsSynthesisRequest *
+        emitChunk: (float32 array -> Task) *
+        cancellationToken: CancellationToken -> Task<TtsSynthesisResult>
 
 type PersonaPlexRuntimeStatus =
     { Ready: bool
@@ -96,7 +174,13 @@ type VoiceAgentStreamingEvent =
     | VoiceAgentTranscription of sessionId: string * requestId: string * turnIndex: int * transcript: string
     | VoiceAgentToolCall of sessionId: string * requestId: string * turnIndex: int * call: AgentToolCallInfo
     | VoiceAgentToolResult of sessionId: string * requestId: string * turnIndex: int * result: AgentToolResultInfo
+    | VoiceAgentFillerText of sessionId: string * requestId: string * turnIndex: int * text: string
     | VoiceAgentFinalText of sessionId: string * requestId: string * turnIndex: int * text: string
+    | TtsSynthesisStarted of sessionId: string * requestId: string * turnIndex: int * phase: string * text: string
+    | TtsAudioChunk of sessionId: string * requestId: string * turnIndex: int * phase: string * sampleRate: int * samples: float32 array
+    | TtsSynthesisDone of sessionId: string * requestId: string * turnIndex: int * result: TtsSynthesisResult
+    | TtsSynthesisCanceled of sessionId: string * requestId: string * turnIndex: int * phase: string
+    | TtsUnavailable of sessionId: string * requestId: string * turnIndex: int * phase: string * message: string
     | PersonaPlexCodecStarted of sessionId: string * requestId: string * turnIndex: int
     | PersonaPlexCodecDone of sessionId: string * requestId: string * turnIndex: int * result: PersonaPlexCodecResult
     | PersonaPlexGenerationStarted of sessionId: string * requestId: string * turnIndex: int
@@ -115,6 +199,8 @@ type VoiceAgentRuntimeStatus =
       MaxTurnAudioSeconds: float
       MaxTurnAudioSamples24k: int
       Gemma: GemmaRuntimeStatus
+      Stt: SttRuntimeStatus
+      Tts: TtsRuntimeStatus
       PersonaPlex: PersonaPlexRuntimeStatus
       Message: string }
 

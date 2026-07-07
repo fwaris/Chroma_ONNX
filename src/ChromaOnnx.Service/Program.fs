@@ -11,15 +11,15 @@ module Program =
         try
             let builder = WebApplication.CreateBuilder(argv)
             let options = VoiceAgentWebApp.bindOptions builder.Configuration
-            printfn "GemmaPersonaPlexAgent initializing runtime."
+            printfn "GemmaVoiceAgent initializing runtime."
             printfn "Configured Gemma model: %s" options.Gemma.ModelDir
             printfn "Configured Gemma runtime: %s" options.Gemma.Runtime
-            printfn "Configured PersonaPlex model: %s" options.PersonaPlex.ModelDir
-            printfn "Configured PersonaPlex runtime: %s" options.PersonaPlex.Runtime
-            printfn "Configured PersonaPlex provider: %s" options.PersonaPlex.ExecutionProvider
+            printfn "Configured TTS model: %s" options.Tts.ModelDir
+            printfn "Configured TTS runtime: %s" options.Tts.Runtime
+            printfn "Configured TTS provider: %s" options.Tts.ExecutionProvider
             Console.Out.Flush()
 
-            let agentRuntime = new GemmaPersonaPlexAgentRuntime(options)
+            let agentRuntime = new GemmaVoiceAgentRuntime(options)
             builder.Services.AddSingleton<IVoiceAgentRuntime>(agentRuntime) |> ignore
 
             let app = builder.Build()
@@ -31,9 +31,10 @@ module Program =
             VoiceAgentWebApp.map app agentRuntime |> ignore
 
             let agentStatus = agentRuntime.Status()
-            printfn "GemmaPersonaPlexAgent service listening."
+            printfn "GemmaVoiceAgent service listening."
             printfn "Gemma status: %s" agentStatus.Gemma.Message
-            printfn "PersonaPlex status: %s" agentStatus.PersonaPlex.Message
+            printfn "STT status: %s" agentStatus.Stt.Message
+            printfn "TTS status: %s" agentStatus.Tts.Message
             printfn "Agent status: %s" agentStatus.Message
             app.Run()
             0
