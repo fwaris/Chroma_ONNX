@@ -443,13 +443,64 @@ module Program =
                                 "It is time to test the agent."
                             else
                                 """<|tool_call>call:get_current_time{}<tool_call|>"""
-                    return
+                    let result: GemmaGenerationResult =
                         { Text = text
                           Prompt = "fake"
                           InputTokenCount = 1
                           OutputTokenIds = [| 1L |]
                           StopReason = "fake"
                           TimingsMs = Map.empty }
+                    return result
+                }
+
+    type private FakePersonaPlexRuntime(?codecReady: bool) =
+        let codecReady = defaultArg codecReady true
+        interface IPersonaPlexRuntime with
+            member _.Status() =
+                { Ready = codecReady
+                  CodecReady = codecReady
+                  SpeechToSpeechReady = false
+                  SupportsStreaming = false
+                  SupportsDuplex = false
+                  Runtime = "fake"
+                  ModelDir = "models/fake-personaplex"
+                  ExecutionProvider = "cpu"
+                  VoicePreset = "NATF2"
+                  MissingFiles = if codecReady then Array.empty else [| "mimi_encoder.onnx" |]
+                  Message =
+                    if codecReady then
+                        "fake PersonaPlex codec ready; STS unavailable"
+                    else
+                        "fake PersonaPlex codec missing" }
+
+            member _.RunCodecRoundTripAsync(samples24k, outputDirectory, cancellationToken) =
+                task {
+                    cancellationToken.ThrowIfCancellationRequested()
+                    Directory.CreateDirectory(outputDirectory) |> ignore
+                    let outputPath = Path.Combine(outputDirectory, "audio.wav")
+                    File.WriteAllBytes(outputPath, [| 0x52uy; 0x49uy; 0x46uy; 0x46uy |])
+                    return
+                        { OutputPath = Some outputPath
+                          DurationMs = float samples24k.Length / 24.0
+                          InferenceTimeMs = 1.0
+                          SampleRate = 24000
+                          Message = "fake codec round trip" }
+                }
+
+            member _.RunSpeechToSpeechAsync(samples24k, outputDirectory, cancellationToken) =
+                task {
+                    cancellationToken.ThrowIfCancellationRequested()
+                    Directory.CreateDirectory(outputDirectory) |> ignore
+                    let outputPath = Path.Combine(outputDirectory, "audio.wav")
+                    File.WriteAllBytes(outputPath, [| 0x52uy; 0x49uy; 0x46uy; 0x46uy |])
+                    return
+                        { OutputPath = Some outputPath
+                          InputFrames = 1
+                          GeneratedFrames = 0
+                          SampleRate = 24000
+                          DurationMs = float samples24k.Length / 24.0
+                          InferenceTimeMs = 1.0
+                          Message = "fake full onnx diagnostic generation" }
                 }
 
     let private withTestApp (test: WebApplication -> HttpClient -> Task) =
@@ -485,6 +536,34 @@ module Program =
             new GemmaChromaAgentRuntime(gemmaOptions, runtime, gemmaRuntime = gemma, workDir = workDir)
             :> IAgentRuntime
         S2sWebApp.mapWithAgent app runtime agent |> ignore
+        try
+            waitTask (app.StartAsync())
+            use client = app.GetTestClient()
+            waitTask (test app client)
+        finally
+            waitTask (app.StopAsync())
+            (agent :?> IDisposable).Dispose()
+            (app :> IDisposable).Dispose()
+            if Directory.Exists workDir then
+                Directory.Delete(workDir, true)
+
+    let private withVoiceAgentTestApp (test: WebApplication -> HttpClient -> Task) =
+        let workDir = Path.Combine(Path.GetTempPath(), $"voice-agent-tests-{Guid.NewGuid():N}")
+        Directory.CreateDirectory(workDir) |> ignore
+        let builder = WebApplication.CreateBuilder([||])
+        builder.Logging.ClearProviders() |> ignore
+        builder.WebHost.UseTestServer() |> ignore
+        let app = builder.Build()
+        let options = VoiceAgentOptions()
+        options.WorkDir <- workDir
+        options.MaxHistoryTurns <- 2
+        options.PersonaPlex.ExecutionProvider <- "cpu"
+        let gemma = FakeGemmaRuntime() :> IGemmaRuntime
+        let personaPlex = FakePersonaPlexRuntime() :> IPersonaPlexRuntime
+        let agent =
+            new GemmaPersonaPlexAgentRuntime(options, gemmaRuntime = gemma, personaPlexRuntime = personaPlex, workDir = workDir)
+            :> IVoiceAgentRuntime
+        VoiceAgentWebApp.map app agent |> ignore
         try
             waitTask (app.StartAsync())
             use client = app.GetTestClient()
@@ -763,6 +842,127 @@ module Program =
                         fail $"agent details artifact turn {turnIndex}" $"unexpected details: {detailsBody}"
                     if not (detailsBody.Contains("get_current_time", StringComparison.Ordinal)) then
                         fail $"agent tool artifact turn {turnIndex}" $"tool call was not recorded: {detailsBody}"
+
+                ignore firstDone
+                ignore secondDone
+            })
+
+    let private voiceAgentWebSocketAndDetails () =
+        let receiveMessage (socket: WebSocket) =
+            task {
+                let buffer = Array.zeroCreate<byte> 4096
+                use stream = new MemoryStream()
+                let mutable messageType = WebSocketMessageType.Close
+                let mutable complete = false
+                while not complete do
+                    let! result = socket.ReceiveAsync(ArraySegment<byte>(buffer), CancellationToken.None)
+                    messageType <- result.MessageType
+                    if result.Count > 0 then
+                        stream.Write(buffer, 0, result.Count)
+                    complete <- result.EndOfMessage || result.MessageType = WebSocketMessageType.Close
+                return messageType, stream.ToArray()
+            }
+
+        let sendText (socket: WebSocket) (text: string) =
+            let bytes = Encoding.UTF8.GetBytes(text)
+            socket.SendAsync(ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None)
+
+        let sendBinary (socket: WebSocket) bytes =
+            socket.SendAsync(ArraySegment<byte>(bytes), WebSocketMessageType.Binary, true, CancellationToken.None)
+
+        withVoiceAgentTestApp (fun app client ->
+            task {
+                let! s2sResponse = client.PostAsync("/api/s2s/sessions", new StringContent("{}"))
+                assertEqual "voice agent no s2s route" HttpStatusCode.NotFound s2sResponse.StatusCode
+
+                use content = new MultipartFormDataContent()
+                content.Add(new StringContent("You are in an integration smoke test. Call get_current_time before answering."), "systemPrompt")
+                let! response = client.PostAsync("/api/agent/sessions", content)
+                assertEqual "voice agent session create" HttpStatusCode.OK response.StatusCode
+                let! sessionJson = response.Content.ReadAsStringAsync()
+                use sessionDoc = JsonDocument.Parse(sessionJson)
+                let sessionId = sessionDoc.RootElement.GetProperty("id").GetString()
+                let websocketUrl = sessionDoc.RootElement.GetProperty("websocketUrl").GetString()
+
+                let wsClient = app.GetTestServer().CreateWebSocketClient()
+                use! socket = wsClient.ConnectAsync(Uri($"ws://localhost{websocketUrl}"), CancellationToken.None)
+                let seen = ResizeArray<string>()
+                let receivePayload () =
+                    task {
+                        let! messageType, payload = receiveMessage socket
+                        match messageType with
+                        | WebSocketMessageType.Text ->
+                            let text = Encoding.UTF8.GetString(payload)
+                            use doc = JsonDocument.Parse(text)
+                            let eventType =
+                                doc.RootElement.GetProperty("type").GetString()
+                                |> Option.ofObj
+                                |> Option.defaultValue ""
+                            seen.Add eventType
+                            return eventType, Some(doc.RootElement.Clone())
+                        | _ -> return "close", None
+                    }
+
+                let! ready, readyPayload = receivePayload ()
+                assertEqual "voice agent socket ready" "session.ready" ready
+                match readyPayload with
+                | Some payload ->
+                    assertEqual "voice agent personaplex sts gated" false (payload.GetProperty("personaPlexSpeechToSpeechReady").GetBoolean())
+                | None -> fail "voice agent socket ready" "ready payload missing"
+
+                let sendAgentTurn samples expectedTurnIndex =
+                    task {
+                        let startSeenCount = seen.Count
+                        do! sendText socket """{"type":"turn.start"}"""
+                        let! accepted, _ = receivePayload ()
+                        assertEqual $"voice agent turn {expectedTurnIndex} accepted" "turn.accepted" accepted
+                        do! sendBinary socket (AudioChunk.float32ToLittleEndianBytes samples)
+                        let! chunkAck, _ = receivePayload ()
+                        assertEqual $"voice agent turn {expectedTurnIndex} chunk" "turn.chunk" chunkAck
+                        do! sendText socket """{"type":"turn.end"}"""
+
+                        let mutable donePayload: JsonElement option = None
+                        let stopwatch = Stopwatch.StartNew()
+                        while donePayload.IsNone && stopwatch.Elapsed < TimeSpan.FromSeconds(5.0) do
+                            let! eventType, payload = receivePayload ()
+                            if eventType = "agent.done" then
+                                donePayload <- payload
+
+                        match donePayload with
+                        | None ->
+                            let seenText = String.Join(",", seen)
+                            return fail $"voice agent websocket turn {expectedTurnIndex}" $"agent.done was not observed. Events: {seenText}"
+                        | Some payload ->
+                            assertEqual $"voice agent done turn {expectedTurnIndex}" expectedTurnIndex (payload.GetProperty("turnIndex").GetInt32())
+                            let turnEvents =
+                                seen
+                                |> Seq.skip startSeenCount
+                                |> Seq.toArray
+                            if not (turnEvents |> Array.contains "agent.transcription") then fail $"voice agent turn {expectedTurnIndex}" "transcription event missing"
+                            if not (turnEvents |> Array.contains "agent.tool_call") then fail $"voice agent turn {expectedTurnIndex}" "tool call event missing"
+                            if not (turnEvents |> Array.contains "agent.tool_result") then fail $"voice agent turn {expectedTurnIndex}" "tool result event missing"
+                            if not (turnEvents |> Array.contains "agent.final_text") then fail $"voice agent turn {expectedTurnIndex}" "final text event missing"
+                            if not (turnEvents |> Array.contains "personaplex.codec.started") then fail $"voice agent turn {expectedTurnIndex}" "PersonaPlex codec start missing"
+                            if not (turnEvents |> Array.contains "personaplex.codec.done") then fail $"voice agent turn {expectedTurnIndex}" "PersonaPlex codec done missing"
+                            if not (turnEvents |> Array.contains "personaplex.unavailable") then fail $"voice agent turn {expectedTurnIndex}" "PersonaPlex unavailable event missing"
+                            return payload
+                    }
+
+                let! firstDone = sendAgentTurn [| 0.0f; 0.2f; 0.1f; 0.0f |] 1
+                let! secondDone = sendAgentTurn [| 0.1f; 0.0f; 0.3f; 0.0f |] 2
+
+                for turnIndex in [| 1; 2 |] do
+                    let! detailsResponse = client.GetAsync($"/api/agent/sessions/{sessionId}/turns/{turnIndex}/details.json")
+                    assertEqual $"voice agent details turn {turnIndex}" HttpStatusCode.OK detailsResponse.StatusCode
+                    let! detailsBody = detailsResponse.Content.ReadAsStringAsync()
+                    if not (detailsBody.Contains("It is time to test the agent.", StringComparison.Ordinal)) then
+                        fail $"voice agent details turn {turnIndex}" $"unexpected details: {detailsBody}"
+                    if not (detailsBody.Contains("get_current_time", StringComparison.Ordinal)) then
+                        fail $"voice agent tool artifact turn {turnIndex}" $"tool call was not recorded: {detailsBody}"
+                    if not (detailsBody.Contains("personaPlexStatus", StringComparison.Ordinal)) then
+                        fail $"voice agent details turn {turnIndex}" $"PersonaPlex status missing: {detailsBody}"
+                    let! audioResponse = client.GetAsync($"/api/agent/sessions/{sessionId}/turns/{turnIndex}/audio.wav")
+                    assertEqual $"voice agent audio artifact turn {turnIndex}" HttpStatusCode.OK audioResponse.StatusCode
 
                 ignore firstDone
                 ignore secondDone
@@ -1304,6 +1504,31 @@ module Program =
         assertEqual "bound gemma tool rounds" 5 boundGemma.ToolMaxRounds
         assertEqual "bound gemma history turns" 11 boundGemma.MaxHistoryTurns
 
+        let voiceValues = Dictionary<string, string>()
+        voiceValues["VoiceAgent:WorkDir"] <- "served_runs_voice"
+        voiceValues["VoiceAgent:MaxHistoryTurns"] <- "6"
+        voiceValues["VoiceAgent:MaxTurnAudioSeconds"] <- "12"
+        voiceValues["VoiceAgent:Gemma:ModelDir"] <- "models/gemma-voice"
+        voiceValues["VoiceAgent:Gemma:Runtime"] <- "ort-genai"
+        voiceValues["VoiceAgent:PersonaPlex:ModelDir"] <- "models/personaplex"
+        voiceValues["VoiceAgent:PersonaPlex:Runtime"] <- "elbruno-codec"
+        voiceValues["VoiceAgent:PersonaPlex:ExecutionProvider"] <- "cpu"
+        voiceValues["VoiceAgent:PersonaPlex:VoicePreset"] <- "VARF2"
+        let voiceConfiguration =
+            ConfigurationBuilder()
+                .AddInMemoryCollection(voiceValues)
+                .Build()
+        let voiceOptions = VoiceAgentWebApp.bindOptions voiceConfiguration
+        assertEqual "voice agent work dir" "served_runs_voice" voiceOptions.WorkDir
+        assertEqual "voice agent history turns" 6 voiceOptions.MaxHistoryTurns
+        assertEqual "voice agent turn seconds" 12.0 voiceOptions.MaxTurnAudioSeconds
+        assertEqual "voice agent gemma model" "models/gemma-voice" voiceOptions.Gemma.ModelDir
+        assertEqual "voice agent gemma runtime" "ort-genai" voiceOptions.Gemma.Runtime
+        assertEqual "voice agent personaplex model" "models/personaplex" voiceOptions.PersonaPlex.ModelDir
+        assertEqual "voice agent personaplex runtime" "elbruno-codec" voiceOptions.PersonaPlex.Runtime
+        assertEqual "voice agent personaplex provider" "cpu" voiceOptions.PersonaPlex.ExecutionProvider
+        assertEqual "voice agent personaplex voice" "VARF2" voiceOptions.PersonaPlex.VoicePreset
+
     let private runtimePathResolution () =
         let normalize path = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path))
         let root = Path.Combine(Path.GetTempPath(), $"chroma-onnx-paths-{Guid.NewGuid():N}")
@@ -1432,6 +1657,7 @@ module Program =
         serviceRejectsPythonBackend ()
         serviceWebSocketAndArtifacts ()
         agentWebSocketAndDetails ()
+        voiceAgentWebSocketAndDetails ()
         realChromaAgentWebSocketSmokeIfRequested ()
         realGemmaToolSmokeIfRequested ()
         realGemmaAudioSmokeIfRequested ()

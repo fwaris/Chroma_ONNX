@@ -8,6 +8,7 @@
 
   <ItemGroup>
     <Compile Include="App.fs" />
+    <Compile Include="VoiceAgentApp.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
