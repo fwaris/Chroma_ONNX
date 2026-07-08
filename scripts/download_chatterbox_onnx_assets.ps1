@@ -1,47 +1,50 @@
 param(
     [string]$AssetsRoot = "E:\s\temp\VoiceAgent_assets",
-    [string]$RepoId = "soniqo/VoxCPM2-ONNX",
+    [string]$RepoId = "onnx-community/chatterbox-ONNX",
     [string]$Revision = "main",
-    [switch]$IncludeSplitGraphs,
+    [ValidateSet("q4f16", "q4", "fp16", "fp32")]
+    [string]$LanguageModelVariant = "q4f16",
     [switch]$SkipExisting
 )
 
 $ErrorActionPreference = "Stop"
 
 $AssetsRoot = [System.IO.Path]::GetFullPath($AssetsRoot)
-$modelDir = Join-Path $AssetsRoot "models\voxcpm2-onnx"
+$modelDir = Join-Path $AssetsRoot "models\chatterbox-onnx"
 New-Item -ItemType Directory -Force -Path $modelDir | Out-Null
 
-$files = @(
-    "config.json",
-    "special_tokens_map.json",
-    "tokenization_voxcpm2.py",
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "voxcpm2-audio-decoder.onnx",
-    "voxcpm2-audio-encoder.onnx",
-    "voxcpm2-decoder.onnx",
-    "voxcpm2-decoder.onnx.data"
-)
-
-if ($IncludeSplitGraphs) {
-    $files += @(
-        "voxcpm2-text-prefill.onnx",
-        "voxcpm2-text-prefill.onnx.data",
-        "voxcpm2-token-step.onnx",
-        "voxcpm2-token-step.onnx.data"
-    )
+$languageModelFiles = switch ($LanguageModelVariant) {
+    "q4f16" { @("onnx/language_model_q4f16.onnx", "onnx/language_model_q4f16.onnx_data") }
+    "q4" { @("onnx/language_model_q4.onnx", "onnx/language_model_q4.onnx_data") }
+    "fp16" { @("onnx/language_model_fp16.onnx", "onnx/language_model_fp16.onnx_data") }
+    "fp32" { @("onnx/language_model.onnx", "onnx/language_model.onnx_data") }
 }
 
+$files = @(
+    "README.md",
+    "config.json",
+    "generation_config.json",
+    "preprocessor_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "default_voice.wav",
+    "onnx/conditional_decoder.onnx",
+    "onnx/conditional_decoder.onnx_data",
+    "onnx/embed_tokens.onnx",
+    "onnx/embed_tokens.onnx_data",
+    "onnx/speech_encoder.onnx",
+    "onnx/speech_encoder.onnx_data"
+) + $languageModelFiles
+
 function Invoke-HuggingFaceDownload([string]$FileName, [string]$Destination) {
-    $encodedRepo = $RepoId
-    $url = "https://huggingface.co/$encodedRepo/resolve/$Revision/$FileName"
+    $url = "https://huggingface.co/$RepoId/resolve/$Revision/$FileName"
     $tmp = "$Destination.partial"
     if ($SkipExisting -and (Test-Path -LiteralPath $Destination)) {
         Write-Host "Already present: $Destination"
         return
     }
 
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Destination) | Out-Null
     $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
     if ($curl) {
         & $curl.Source -L --fail --retry 5 --retry-delay 2 -C - -o $tmp $url
@@ -55,14 +58,14 @@ function Invoke-HuggingFaceDownload([string]$FileName, [string]$Destination) {
 }
 
 foreach ($fileName in $files) {
-    $destination = Join-Path $modelDir $fileName
+    $destination = Join-Path $modelDir ($fileName -replace '/', [System.IO.Path]::DirectorySeparatorChar)
     Write-Host "Downloading $RepoId/$fileName"
     Invoke-HuggingFaceDownload $fileName $destination
 }
 
 $manifestFiles =
     foreach ($fileName in $files) {
-        $path = Join-Path $modelDir $fileName
+        $path = Join-Path $modelDir ($fileName -replace '/', [System.IO.Path]::DirectorySeparatorChar)
         $item = Get-Item -LiteralPath $path
         [pscustomobject]@{
             path = $fileName
@@ -76,13 +79,14 @@ $manifest = [pscustomobject]@{
     revision = $Revision
     modelDir = $modelDir
     generatedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
-    includesSplitGraphs = [bool]$IncludeSplitGraphs
+    languageModelVariant = $LanguageModelVariant
     files = $manifestFiles
 }
 
-$manifestPath = Join-Path $modelDir "voice_agent_voxcpm2_onnx_manifest.json"
+$manifestPath = Join-Path $modelDir "voice_agent_chatterbox_onnx_manifest.json"
 $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
 
-Write-Host "VoxCPM2 ONNX assets are ready."
+Write-Host "Chatterbox ONNX assets are ready."
 Write-Host "ModelDir: $modelDir"
+Write-Host "Variant: $LanguageModelVariant"
 Write-Host "Manifest: $manifestPath"

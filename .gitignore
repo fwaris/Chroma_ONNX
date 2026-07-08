@@ -20,3 +20,4 @@ onnx_deploy/**/tensorrt-engines/
 sample_inputs/
 sample_outputs/
 served_runs/
+publish/

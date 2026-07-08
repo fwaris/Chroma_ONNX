@@ -1,9 +1,8 @@
 param(
     [string]$AssetsRoot = "",
     [string]$RuntimeRoot = "",
-    [ValidateSet("voxcpm2-cli", "fake-tone")]
+    [ValidateSet("chatterbox-onnx", "fake-tone")]
     [string]$TtsRuntime = "fake-tone",
-    [string]$TtsExecutablePath = "",
     [string]$TtsModelDir = "",
     [string]$VoiceSamplePath = "",
     [string]$VoiceSampleTranscript = "",
@@ -37,6 +36,45 @@ $AssetsRoot = [System.IO.Path]::GetFullPath($AssetsRoot)
 if ($CudaBin) { $env:PATH = "$CudaBin;$env:PATH" }
 if ($CudnnBin) { $env:PATH = "$CudnnBin;$env:PATH" }
 
+function Find-DllForProcess([string]$DllName, [string[]]$ExtraDirectories) {
+    foreach ($dir in $ExtraDirectories) {
+        if ($dir -and (Test-Path -LiteralPath (Join-Path $dir $DllName))) {
+            return (Join-Path $dir $DllName)
+        }
+    }
+    $pathValue = $env:PATH
+    if (-not [string]::IsNullOrWhiteSpace($pathValue)) {
+        foreach ($dir in $pathValue.Split([IO.Path]::PathSeparator, [StringSplitOptions]::RemoveEmptyEntries)) {
+            if ($dir -and (Test-Path -LiteralPath (Join-Path $dir $DllName))) {
+                return (Join-Path $dir $DllName)
+            }
+        }
+    }
+    return $null
+}
+
+function Assert-CudaRuntimeDlls([string]$RuntimeRoot) {
+    $serviceDir = Join-Path $RuntimeRoot "app\service"
+    $extraDirs = @($serviceDir)
+    $requiredDlls = @(
+        "cudart64_12.dll",
+        "cublas64_12.dll",
+        "cublasLt64_12.dll",
+        "cufft64_11.dll",
+        "curand64_10.dll",
+        "cudnn64_9.dll"
+    )
+    $missing = @()
+    foreach ($dll in $requiredDlls) {
+        if (-not (Find-DllForProcess $dll $extraDirs)) {
+            $missing += $dll
+        }
+    }
+    if ($missing.Count -gt 0) {
+        throw "Missing CUDA/cuDNN runtime DLL(s) required by the packaged ONNX Runtime CUDA provider: $($missing -join ', '). Install/stage CUDA 12.x runtime plus cuDNN 9, or rerun this script with -CudaBin and -CudnnBin pointing at their bin folders."
+    }
+}
+
 function Assert-PathExists([string]$Path, [string]$Label) {
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "$Label was not found: $Path"
@@ -44,10 +82,7 @@ function Assert-PathExists([string]$Path, [string]$Label) {
 }
 
 if (-not $TtsModelDir) {
-    $TtsModelDir = Join-Path $AssetsRoot "models\voxcpm2-onnx"
-}
-if (-not $TtsExecutablePath) {
-    $TtsExecutablePath = Join-Path $RuntimeRoot "tools\speech_voxcpm2_clone_onnx.exe"
+    $TtsModelDir = Join-Path $AssetsRoot "models\chatterbox-onnx"
 }
 
 $env:VoiceAgent__WorkDir = Join-Path $RuntimeRoot "served_runs"
@@ -60,11 +95,10 @@ $env:VoiceAgent__Gemma__ExecutionProvider = "cuda"
 $env:VoiceAgent__Tts__ModelDir = [System.IO.Path]::GetFullPath($TtsModelDir)
 $env:VoiceAgent__Tts__Runtime = $TtsRuntime
 $env:VoiceAgent__Tts__ExecutionProvider = "cuda"
-$env:VoiceAgent__Tts__ExecutablePath = [System.IO.Path]::GetFullPath($TtsExecutablePath)
-$env:VoiceAgent__Tts__Variant = "onnx"
+$env:VoiceAgent__Tts__Variant = "q4f16"
 $env:VoiceAgent__Tts__VoiceSamplePath = $VoiceSamplePath
 $env:VoiceAgent__Tts__VoiceSampleTranscript = $VoiceSampleTranscript
-$env:VoiceAgent__Tts__OutputSampleRate = "48000"
+$env:VoiceAgent__Tts__OutputSampleRate = "24000"
 $env:VoiceAgent__Tts__MaxSteps = [string]$TtsMaxSteps
 $env:VoiceAgent__Tts__StreamingChunkSeconds = "0.5"
 $env:VoiceAgent__Tts__RequireGpu = [string]$RequireTtsGpu
@@ -73,23 +107,36 @@ $env:VoiceAgent__Tts__CudaDeviceId = [string]$TtsCudaDeviceId
 $env:VoiceAgent__Tts__GpuMemoryLimitGb = [string]$TtsGpuMemoryLimitGb
 
 Assert-PathExists (Join-Path $RuntimeRoot "app\service\ChromaOnnx.Service.exe") "Voice agent service"
+if ($TtsRuntime -eq "chatterbox-onnx") {
+    $speechDll = Join-Path $RuntimeRoot "app\service\ChromaOnnx.SpeechToSpeech.dll"
+    Assert-PathExists $speechDll "Speech-to-speech runtime DLL"
+    $speechDllText = [Text.Encoding]::Unicode.GetString([IO.File]::ReadAllBytes($speechDll))
+    if (-not $speechDllText.Contains("chatterbox-onnx")) {
+        throw "The deployed ChromaOnnx.SpeechToSpeech.dll does not contain the Chatterbox runtime. Re-apply the latest VoiceAgent A100 runtime diff."
+    }
+}
 Assert-PathExists (Join-Path $env:VoiceAgent__Gemma__ModelDir "genai_config.json") "Gemma ORT GenAI config"
 Assert-PathExists (Join-Path $env:VoiceAgent__Gemma__ModelDir "tokenizer.json") "Gemma tokenizer"
 Assert-PathExists (Join-Path $env:VoiceAgent__Gemma__ModelDir "embedding\model.onnx") "Gemma embedding graph"
 Assert-PathExists (Join-Path $env:VoiceAgent__Gemma__ModelDir "audio_encoder\model.onnx") "Gemma audio encoder graph"
 Assert-PathExists (Join-Path $env:VoiceAgent__Gemma__ModelDir "decoder\model.onnx") "Gemma decoder graph"
 
-if ($TtsRuntime -eq "voxcpm2-cli") {
-    Assert-PathExists $env:VoiceAgent__Tts__ExecutablePath "VoxCPM2 ONNX CLI"
-    Assert-PathExists (Join-Path $env:VoiceAgent__Tts__ModelDir "voxcpm2-decoder.onnx") "VoxCPM2 decoder graph"
-    Assert-PathExists (Join-Path $env:VoiceAgent__Tts__ModelDir "voxcpm2-decoder.onnx.data") "VoxCPM2 decoder external data"
-    Assert-PathExists (Join-Path $env:VoiceAgent__Tts__ModelDir "voxcpm2-audio-encoder.onnx") "VoxCPM2 audio encoder graph"
-    Assert-PathExists (Join-Path $env:VoiceAgent__Tts__ModelDir "voxcpm2-audio-decoder.onnx") "VoxCPM2 audio decoder graph"
-    Assert-PathExists (Join-Path $env:VoiceAgent__Tts__ModelDir "tokenizer.json") "VoxCPM2 tokenizer"
+if ($TtsRuntime -eq "chatterbox-onnx") {
+    Assert-PathExists (Join-Path $env:VoiceAgent__Tts__ModelDir "default_voice.wav") "Chatterbox default voice"
+    Assert-PathExists (Join-Path $env:VoiceAgent__Tts__ModelDir "tokenizer.json") "Chatterbox tokenizer"
+    Assert-PathExists (Join-Path $env:VoiceAgent__Tts__ModelDir "onnx\speech_encoder.onnx") "Chatterbox speech encoder"
+    Assert-PathExists (Join-Path $env:VoiceAgent__Tts__ModelDir "onnx\speech_encoder.onnx_data") "Chatterbox speech encoder external data"
+    Assert-PathExists (Join-Path $env:VoiceAgent__Tts__ModelDir "onnx\embed_tokens.onnx") "Chatterbox embed tokens"
+    Assert-PathExists (Join-Path $env:VoiceAgent__Tts__ModelDir "onnx\embed_tokens.onnx_data") "Chatterbox embed tokens external data"
+    Assert-PathExists (Join-Path $env:VoiceAgent__Tts__ModelDir "onnx\language_model_q4f16.onnx") "Chatterbox q4f16 language model"
+    Assert-PathExists (Join-Path $env:VoiceAgent__Tts__ModelDir "onnx\language_model_q4f16.onnx_data") "Chatterbox q4f16 language model external data"
+    Assert-PathExists (Join-Path $env:VoiceAgent__Tts__ModelDir "onnx\conditional_decoder.onnx") "Chatterbox conditional decoder"
+    Assert-PathExists (Join-Path $env:VoiceAgent__Tts__ModelDir "onnx\conditional_decoder.onnx_data") "Chatterbox conditional decoder external data"
     if ($VoiceSamplePath) {
         Assert-PathExists ([System.IO.Path]::GetFullPath($VoiceSamplePath)) "Voice sample"
     }
 }
+Assert-CudaRuntimeDlls $RuntimeRoot
 
 $logDir = Join-Path $RuntimeRoot "served_runs\smoke_logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null

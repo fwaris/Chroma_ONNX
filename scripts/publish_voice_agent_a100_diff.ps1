@@ -5,7 +5,12 @@ param(
     [string]$ZipPath = "",
     [string]$Configuration = "Release",
     [string]$RuntimeIdentifier = "win-x64",
-    [string]$TtsExecutablePath = "",
+    [string]$OrtGenAiRoot = "E:\s\repos\onnxruntime-genai",
+    [string]$OrtGenAiBuildName = "WindowsNinjaCudaA100Sm80",
+    [string]$OrtGenAiBuildDir = "",
+    [string]$OrtGenAiManagedDir = "",
+    [string]$OrtNativeDir = "",
+    [string]$OrtNativePackageVersion = "1.27.0",
     [switch]$SkipPublish,
     [switch]$SkipAssetValidation
 )
@@ -28,8 +33,23 @@ if (-not $SkipPublish) {
         "-RuntimeIdentifier", $RuntimeIdentifier,
         "-FrameworkDependent"
     )
-    if ($TtsExecutablePath) {
-        $publishArgs += @("-TtsExecutablePath", $TtsExecutablePath)
+    if ($OrtGenAiRoot) {
+        $publishArgs += @("-OrtGenAiRoot", $OrtGenAiRoot)
+    }
+    if ($OrtGenAiBuildName) {
+        $publishArgs += @("-OrtGenAiBuildName", $OrtGenAiBuildName)
+    }
+    if ($OrtGenAiBuildDir) {
+        $publishArgs += @("-OrtGenAiBuildDir", $OrtGenAiBuildDir)
+    }
+    if ($OrtGenAiManagedDir) {
+        $publishArgs += @("-OrtGenAiManagedDir", $OrtGenAiManagedDir)
+    }
+    if ($OrtNativeDir) {
+        $publishArgs += @("-OrtNativeDir", $OrtNativeDir)
+    }
+    if ($OrtNativePackageVersion) {
+        $publishArgs += @("-OrtNativePackageVersion", $OrtNativePackageVersion)
     }
     if ($SkipAssetValidation) {
         $publishArgs += "-SkipAssetValidation"

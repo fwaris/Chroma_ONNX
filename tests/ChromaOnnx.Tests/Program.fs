@@ -1516,13 +1516,12 @@ module Program =
         voiceValues["VoiceAgent:MaxTurnAudioSeconds"] <- "12"
         voiceValues["VoiceAgent:Gemma:ModelDir"] <- "models/gemma-voice"
         voiceValues["VoiceAgent:Gemma:Runtime"] <- "ort-genai"
-        voiceValues["VoiceAgent:Tts:ModelDir"] <- "models/voxcpm2"
-        voiceValues["VoiceAgent:Tts:Runtime"] <- "voxcpm2-cli"
+        voiceValues["VoiceAgent:Tts:ModelDir"] <- "models/chatterbox-onnx"
+        voiceValues["VoiceAgent:Tts:Runtime"] <- "chatterbox-onnx"
         voiceValues["VoiceAgent:Tts:ExecutionProvider"] <- "cpu"
-        voiceValues["VoiceAgent:Tts:ExecutablePath"] <- "speech_voxcpm2_clone_onnx.exe"
         voiceValues["VoiceAgent:Tts:VoiceSamplePath"] <- "voices/ref.wav"
         voiceValues["VoiceAgent:Tts:VoiceSampleTranscript"] <- "reference words"
-        voiceValues["VoiceAgent:Tts:OutputSampleRate"] <- "48000"
+        voiceValues["VoiceAgent:Tts:OutputSampleRate"] <- "24000"
         voiceValues["VoiceAgent:Tts:RequireGpu"] <- "false"
         voiceValues["VoiceAgent:Tts:RequireFullGpu"] <- "true"
         voiceValues["VoiceAgent:Tts:CudaDeviceId"] <- "2"
@@ -1537,13 +1536,12 @@ module Program =
         assertEqual "voice agent turn seconds" 12.0 voiceOptions.MaxTurnAudioSeconds
         assertEqual "voice agent gemma model" "models/gemma-voice" voiceOptions.Gemma.ModelDir
         assertEqual "voice agent gemma runtime" "ort-genai" voiceOptions.Gemma.Runtime
-        assertEqual "voice agent tts model" "models/voxcpm2" voiceOptions.Tts.ModelDir
-        assertEqual "voice agent tts runtime" "voxcpm2-cli" voiceOptions.Tts.Runtime
+        assertEqual "voice agent tts model" "models/chatterbox-onnx" voiceOptions.Tts.ModelDir
+        assertEqual "voice agent tts runtime" "chatterbox-onnx" voiceOptions.Tts.Runtime
         assertEqual "voice agent tts provider" "cpu" voiceOptions.Tts.ExecutionProvider
-        assertEqual "voice agent tts executable" "speech_voxcpm2_clone_onnx.exe" voiceOptions.Tts.ExecutablePath
         assertEqual "voice agent tts voice sample" "voices/ref.wav" voiceOptions.Tts.VoiceSamplePath
         assertEqual "voice agent tts voice transcript" "reference words" voiceOptions.Tts.VoiceSampleTranscript
-        assertEqual "voice agent tts sample rate" 48000 voiceOptions.Tts.OutputSampleRate
+        assertEqual "voice agent tts sample rate" 24000 voiceOptions.Tts.OutputSampleRate
         assertEqual "voice agent tts require gpu" false voiceOptions.Tts.RequireGpu
         assertEqual "voice agent tts require full gpu" true voiceOptions.Tts.RequireFullGpu
         assertEqual "voice agent tts cuda device" 2 voiceOptions.Tts.CudaDeviceId

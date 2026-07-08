@@ -319,9 +319,9 @@ type GemmaVoiceAgentRuntime(options: VoiceAgentOptions, ?gemmaRuntime: IGemmaRun
                       Audio16k = None
                       AddGenerationPrompt = true
                       MaxNewTokens = 24
-                      Temperature = 0.3
-                      TopP = 0.9
-                      TopK = 40 },
+                      Temperature = 0.0
+                      TopP = 1.0
+                      TopK = 0 },
                     cancellationToken)
             let text = cleanText result.Text
             if String.IsNullOrWhiteSpace text then return "Let me check that."

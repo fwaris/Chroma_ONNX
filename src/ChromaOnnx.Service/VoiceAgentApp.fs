@@ -43,6 +43,10 @@ module VoiceAgentWebApp =
     button:disabled { opacity: .6; cursor: wait; }
     section { padding: 18px 24px; display: grid; gap: 14px; align-content: start; }
     .status { border: 1px solid #d7dee6; border-radius: 8px; padding: 12px; color: #5d6875; background: white; }
+    .audioResults { display: grid; gap: 10px; }
+    .audioResult { border: 1px solid #d7dee6; border-radius: 8px; padding: 12px; display: grid; gap: 8px; background: white; }
+    .audioResult a { color: #0f766e; font-weight: 650; text-decoration: none; }
+    audio { width: min(720px, 100%); }
     pre { margin: 0; max-height: 60vh; overflow: auto; background: #101923; color: #e6edf3; border-radius: 6px; padding: 12px; font-size: 12px; }
     @media (max-width: 840px) { main { grid-template-columns: 1fr; } form { border-right: 0; border-bottom: 1px solid #d7dee6; } }
   </style>
@@ -52,12 +56,13 @@ module VoiceAgentWebApp =
   <main>
     <form id="form">
       <label>Mode<select id="mode"><option value="gemma-tts">Gemma + TTS</option></select></label>
-      <label>System prompt<textarea id="systemPrompt">You are a concise voice assistant. Use tools when useful, then answer naturally.</textarea></label>
+      <label>System prompt<textarea id="systemPrompt">You are a concise voice assistant. Use tools when useful. Reply with one or two short spoken sentences unless the user explicitly asks for detail.</textarea></label>
       <label>Turn audio<input id="turnAudio" type="file" accept="audio/*,.f32" required></label>
       <button id="send" type="submit">Send</button>
     </form>
     <section>
       <div id="message" class="status">Idle</div>
+      <div id="audioResults" class="audioResults"></div>
       <pre id="details">{}</pre>
     </section>
   </main>
@@ -66,6 +71,7 @@ module VoiceAgentWebApp =
     const form = document.getElementById('form');
     const message = document.getElementById('message');
     const details = document.getElementById('details');
+    const audioResults = document.getElementById('audioResults');
     const send = document.getElementById('send');
     let audioContext = null;
     let session = null;
@@ -101,6 +107,27 @@ module VoiceAgentWebApp =
       const decoded = await audioContext.decodeAudioData(bytes.slice(0));
       return asByteView(resampleLinear(mixToMono(decoded), decoded.sampleRate, 24000));
     }
+    function renderAudioResult(payload) {
+      if (!payload.audioUrl) return;
+      const url = new URL(payload.audioUrl, location.origin);
+      url.searchParams.set('t', Date.now().toString());
+      const container = document.createElement('div');
+      container.className = 'audioResult';
+      const label = document.createElement('a');
+      label.href = url.toString();
+      label.target = '_blank';
+      label.rel = 'noopener';
+      label.textContent = `Turn ${payload.turnIndex} audio`;
+      const audio = document.createElement('audio');
+      audio.controls = true;
+      audio.preload = 'auto';
+      audio.src = url.toString();
+      container.append(label, audio);
+      audioResults.prepend(container);
+      audio.play()
+        .then(() => { message.textContent = payload.finalText || 'Playing response audio.'; })
+        .catch(() => { message.textContent = 'Audio is ready. Press play in the response audio control.'; });
+    }
     async function ensureSession() {
       if (session) return session;
       const formData = new FormData();
@@ -116,6 +143,7 @@ module VoiceAgentWebApp =
         details.textContent = JSON.stringify(payload, null, 2);
         if (payload.type === 'agent.final_text') message.textContent = payload.text;
         if (payload.type === 'agent.filler_text') message.textContent = payload.text;
+        if (payload.type === 'agent.done') renderAudioResult(payload);
         if (payload.type === 'tts.unavailable') message.textContent = payload.message;
       };
       await new Promise((resolve, reject) => {

@@ -3,7 +3,8 @@ param(
     [string]$Python = "",
     [string]$CudaHome = $env:CUDA_PATH,
     [string]$Configuration = "Release",
-    [string]$BuildName = "WindowsNinjaCudaNoPython5"
+    [string]$BuildName = "WindowsNinjaCudaA100Sm80",
+    [string]$CudaArchitectures = "80"
 )
 
 $ErrorActionPreference = "Stop"
@@ -86,6 +87,7 @@ $msvcFlags = "/DWIN32 /D_WINDOWS /EHsc /wd4875 /D_SILENCE_EXPERIMENTAL_COROUTINE
     "ENABLE_TESTS=OFF" `
     "CMAKE_MAKE_PROGRAM=$ninja" `
     "CMAKE_CUDA_COMPILER=$nvcc" `
+    "CMAKE_CUDA_ARCHITECTURES=$CudaArchitectures" `
     "CMAKE_CXX_FLAGS=$msvcFlags"
 
 $nativeDir = Join-Path $buildDir $Configuration
@@ -97,3 +99,4 @@ dotnet build (Join-Path $OrtGenAiRepo "src\csharp\Microsoft.ML.OnnxRuntimeGenAI.
 Write-Host "ORT GenAI managed artifacts: $(Join-Path $OrtGenAiRepo "src\csharp\bin\$Configuration\net8.0")"
 Write-Host "ORT GenAI native artifacts:  $nativeDir"
 Write-Host "ORT native artifacts:        $(Join-Path $nativeDir $Configuration)"
+Write-Host "CUDA architectures:          $CudaArchitectures"

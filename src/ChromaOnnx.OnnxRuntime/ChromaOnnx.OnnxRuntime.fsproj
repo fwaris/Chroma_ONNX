@@ -9,6 +9,7 @@
     <OrtGenAiRoot Condition="'$(OrtGenAiRoot)' == ''">E:\s\repos\onnxruntime-genai</OrtGenAiRoot>
     <OrtGenAiBuildDir Condition="'$(OrtGenAiBuildDir)' == ''">$(OrtGenAiRoot)\build\WindowsNinjaCudaNoPython5\Release</OrtGenAiBuildDir>
     <OrtGenAiManagedDir Condition="'$(OrtGenAiManagedDir)' == ''">$(OrtGenAiRoot)\src\csharp\bin\Release\net8.0</OrtGenAiManagedDir>
+    <OrtGenAiOrtNativeDir Condition="'$(OrtGenAiOrtNativeDir)' == '' And Exists('$(UserProfile)\.nuget\packages\microsoft.ml.onnxruntime.gpu.windows\1.27.0\runtimes\win-x64\native\onnxruntime_providers_cuda.dll')">$(UserProfile)\.nuget\packages\microsoft.ml.onnxruntime.gpu.windows\1.27.0\runtimes\win-x64\native</OrtGenAiOrtNativeDir>
     <OrtGenAiOrtNativeDir Condition="'$(OrtGenAiOrtNativeDir)' == ''">$(OrtGenAiBuildDir)\Release</OrtGenAiOrtNativeDir>
   </PropertyGroup>
 

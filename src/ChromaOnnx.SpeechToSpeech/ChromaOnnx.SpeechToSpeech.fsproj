@@ -11,6 +11,7 @@
     <Compile Include="AgentRuntimeTypes.fs" />
     <Compile Include="GemmaChromaAgentRuntime.fs" />
     <Compile Include="VoiceAgentTypes.fs" />
+    <Compile Include="ChatterboxOnnxTtsRuntime.fs" />
     <Compile Include="TtsRuntime.fs" />
     <Compile Include="ElBrunoPersonaPlexRuntime.fs" />
     <Compile Include="PersonaPlexFullOnnxRuntime.fs" />
@@ -25,5 +26,7 @@
 
   <ItemGroup>
     <PackageReference Include="ElBruno.PersonaPlex" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" />
+    <PackageReference Include="Tokenizers.HuggingFace" />
   </ItemGroup>
 </Project>

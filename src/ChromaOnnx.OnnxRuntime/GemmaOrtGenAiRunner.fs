@@ -130,9 +130,10 @@ type GemmaOrtGenAiRunner(modelDir: string, variant: string, executionProvider: s
         let doSample = request.Temperature > 0.0 && topK > 1
         parameters.SetSearchOption("max_length", float maxLength)
         parameters.SetSearchOption("do_sample", doSample)
-        parameters.SetSearchOption("temperature", temperature)
-        parameters.SetSearchOption("top_p", topP)
-        parameters.SetSearchOption("top_k", float topK)
+        if doSample then
+            parameters.SetSearchOption("temperature", temperature)
+            parameters.SetSearchOption("top_p", topP)
+            parameters.SetSearchOption("top_k", float topK)
 
     let generate (request: GemmaGenerationRequest) (cancellationToken: CancellationToken) =
         let stopwatch = Stopwatch.StartNew()
